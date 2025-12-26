@@ -12,7 +12,7 @@ This repository borrows some update processes from lucidrains' excellent [Titans
 1. A fully adaptive Titans level which k, q, v, eta, alpha, and the memory itself are meta-learned across all sequences/context.
 2. A hierarchical Hope block, where different blocks (i.e. Titans and FFN) and their inner optimizers are on different levels and have their own gradient flows and contexts. All parameters in blocks are meta-learned and optimized by it's own optizizer in a higher level.
 3. A DMGD (Deep Momentum Gradient Descent) optimizer as an independent level which maps gradients to an orthogonal space and manage the momentum in a 'deep' way.
-4. A simple framework to manage the gradients in meta learning and provides a way for fast training.
+4. A temporal framework for managing gradients in meta-learning, which enables us to process levels at different frequencies and fast training.
 
 ## Install
 
