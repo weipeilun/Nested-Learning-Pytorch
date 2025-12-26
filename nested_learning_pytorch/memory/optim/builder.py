@@ -1,5 +1,5 @@
 from torch.optim import AdamW
-from .deep import DeepGradientDesent
+from .deep import DeepMomentumGradientDesent
 from torch.nn import Module
 from typing import Any, Callable
 
@@ -15,12 +15,12 @@ class OptimizerBuilder(Callable):
         raise NotImplementedError
 
 
-class DeepGradientDesentBuilder(OptimizerBuilder):
-    def __call__(self, model: Module, **kwargs) -> DeepGradientDesent:
-        return DeepGradientDesent(params=model.named_parameters(), **self.kwargs, **kwargs)
+class DeepMomentumGradientDesentBuilder(OptimizerBuilder):
+    def __call__(self, model: Module, **kwargs) -> DeepMomentumGradientDesent:
+        return DeepMomentumGradientDesent(params=model.named_parameters(), **self.kwargs, **kwargs)
     
-    def clone(self) -> 'DeepGradientDesentBuilder':
-        return DeepGradientDesentBuilder(**self.kwargs)
+    def clone(self) -> 'DeepMomentumGradientDesentBuilder':
+        return DeepMomentumGradientDesentBuilder(**self.kwargs)
 
 
 class AdamWBuilder(OptimizerBuilder):

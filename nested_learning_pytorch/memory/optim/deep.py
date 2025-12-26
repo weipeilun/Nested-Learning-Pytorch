@@ -23,14 +23,14 @@ def default_loss_fn(pred, target):
     return (pred - target).pow(2).mean(dim = -1)
 
 
-class DeepGradientDesent(AssocMemory):
+class DeepMomentumGradientDesent(AssocMemory):
     """Deep Gradient Descent implementation (formula 43, 49, 50 in NL paper)."""
     
     # Register this class with type name "Memory"
-    _type_name = "DeepGradientDesent"
+    _type_name = "DeepMomentumGradientDesent"
     
     @dataclass
-    class DeepGradientDesentState(AssocMemState):
+    class DeepMomentumGradientDesentState(AssocMemState):
         momentum: TensorDict | dict[str, torch.Tensor] | None = None
     
     def __init__(
@@ -45,7 +45,7 @@ class DeepGradientDesent(AssocMemory):
         params: dict[str, torch.Tensor],
         inner_loss_fn: Callable = default_loss_fn,
         outer_loss_fn: Callable = default_loss_fn,
-        memory_state_clz: type | None = DeepGradientDesentState,
+        memory_state_clz: type | None = DeepMomentumGradientDesentState,
         model: Module | None = None,
         alpha: float = 0.1,
         max_grad_norm: float | None = None,
@@ -114,7 +114,7 @@ class DeepGradientDesent(AssocMemory):
         grads_dict: TensorDict,
         state: dict[str, AssocMemState] | None = None,
     ):
-        # DeepGradientDesent should not have children blocks
+        # DeepMomentumGradientDesent should not have children blocks
         
         fast_weights = state[self.block_name].fast_weights
         
@@ -305,7 +305,7 @@ class DeepGradientDesent(AssocMemory):
                 state[self.block_name].momentum = momentum_updated
                 updated = True
 
-        # There supposedly should be no children blocks for DeepGradientDesent
+        # There supposedly should be no children blocks for DeepMomentumGradientDesent
         # if self.children_blocks is not None:
         #     for child_block in self.children_blocks:
         #         child_block.cal_inner_grads(logits=logits, state=state, y=y)

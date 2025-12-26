@@ -6,8 +6,8 @@ hydra:
     chdir: false
 
 # Optimizer choice for each block:
-# 1. inner optimizer for meta learning in FFN block: DeepGradientDesent
-# 2. inner optimizer for meta learning in Titans block: DeepGradientDesent
+# 1. inner optimizer for meta learning in FFN block: DeepMomentumGradientDesent
+# 2. inner optimizer for meta learning in Titans block: DeepMomentumGradientDesent
 # 3. outer optimizer for updating the initial weights of memories: AdamW
 # That's because for each FFN inner block and initial weights updating the context of each batch is considered independent, while Titans inner blocks treat the tokens between batches as highly correlated.
 model:
@@ -35,7 +35,7 @@ model:
   optimizers:
     AdamW:
       betas: [0.9, 0.999]
-    DeepGradientDesent:
+    DeepMomentumGradientDesent:
       alpha: 0.9
 
 data:

@@ -11,7 +11,7 @@ representing complex features. Gradient flows are represented transparently acro
 This repository borrows some update processes from lucidrains' excellent [Titans-pytorch project](https://github.com/lucidrains/titans-pytorch), as well as some data structures from kmccleary3301's [nested_learning project](https://github.com/kmccleary3301/nested_learning), and implemented:
 1. A fully adaptive Titans level which k, q, v, eta, alpha, and the memory itself are meta-learned across all sequences/context.
 2. A hierarchical Hope block, where different blocks (i.e. Titans and FFN) and their inner optimizers are on different levels and have their own gradient flows and contexts. All parameters in blocks are meta-learned and optimized by it's own optizizer in a higher level.
-3. A DGD (Delta Gradient Descent) optimizer as a independent level which maps gradients to an orthogonal space and manage the momentum in a 'deep' way.
+3. A DMGD (Deep Momentum Gradient Descent) optimizer as an independent level which maps gradients to an orthogonal space and manage the momentum in a 'deep' way.
 4. A simple framework to manage the gradients in meta learning and provides a way for fast training.
 
 ## Install
