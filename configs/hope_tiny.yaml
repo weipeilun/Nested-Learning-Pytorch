@@ -1,0 +1,74 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+# Optimizer choice for each block:
+# 1. inner optimizer for meta learning in FFN block: DeepGradientDesent
+# 2. inner optimizer for meta learning in Titans block: DeepGradientDesent
+# 3. outer optimizer for updating the initial weights of memories: AdamW
+# That's because for each FFN inner block and initial weights updating the context of each batch is considered independent, while Titans inner blocks treat the tokens between batches as highly correlated.
+model:
+  num_tokens: 64
+  dim: 32
+  num_layers: 2
+  is_training: false
+  blocks:
+    - name: memory_slow
+      type: FFN
+      update_period: 256
+      children_blocks:
+        - name: memory_mid
+          type: FFN
+          update_period: 128
+          children_blocks:
+            - name: memory_fast
+              type: FFN
+              update_period: 64
+              children_blocks:
+                - name: titans_memory
+                  type: FullyAdaptiveTitans
+                  update_period_adaptive: 64
+                  update_period_titans: 32
+  optimizers:
+    AdamW:
+      betas: [0.9, 0.999]
+    DeepGradientDesent:
+      alpha: 0.9
+
+data:
+  source: synthetic
+  vocab_size: 32000
+  seq_len: 64
+  dataset_size: 1024
+  batch_size: 4
+  num_workers: 0
+
+train:
+  steps: 10
+  log_interval: 1
+  device: "cuda"
+  seed: 1234
+  deterministic: true
+  mixed_precision:
+    enabled: false
+    dtype: bf16
+  compile:
+    enable: false
+  checkpoint:
+    enable: true
+    dir: artifacts/checkpoints/pilot_smoke
+    save_interval: 10
+    save_last: true
+
+optim:
+  type: adamw
+  lr: 3.0e-4
+  fused: false
+
+logging:
+  enabled: true
+  backend: json
+  path: logs/pilot_smoke.json

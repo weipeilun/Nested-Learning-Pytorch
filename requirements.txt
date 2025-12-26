@@ -1,0 +1,6 @@
+torch
+hydra-core
+omegaconf
+einops
+tensordict
+tqdm
