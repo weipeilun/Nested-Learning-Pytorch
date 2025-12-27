@@ -9,7 +9,7 @@ hydra:
 # 1. inner optimizer for meta learning in FFN block: DeepMomentumGradientDesent
 # 2. inner optimizer for meta learning in Titans block: DeepMomentumGradientDesent
 # 3. outer optimizer for updating the initial weights of memories: AdamW
-# That's because for each FFN inner block and initial weights updating the context of each batch is considered independent, while Titans inner blocks treat the tokens between batches as highly correlated.
+# That's because for each initial weights updating the context of each batch is considered independent, while inner loops treat the tokens between batches as highly correlated.
 model:
   num_tokens: 64
   dim: 32

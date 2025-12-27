@@ -10,10 +10,10 @@ from torch.nn import Linear, Module, Parameter
 from torch.func import functional_call
 from torch.optim import AdamW
 
-from ..memory_models import MemoryMLP, ResidualNorm
+from ..memory_models import MemoryMLP, NormalizationBuilder
 from ..assoc_memory import AssocMemory, AssocMemState
 
-from ...utils import pack_one_with_inverse, pair, divisible_by, exists, repeat_dict_values, default
+from ...utils import pack_one_with_inverse, exists, repeat_dict_values, default
 
 """
 ein notation:
@@ -60,10 +60,7 @@ class FFNBlock(AssocMemory):
         is_multi_head = False,
         heads: int = 1,
         with_bias: bool = False,
-        pre_rmsnorm = True,
-        max_grad_norm: float | None = None,
-        spectral_norm_surprises = False,
-        mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        normalization: str = 'residual_pre_norm',
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -82,10 +79,6 @@ class FFNBlock(AssocMemory):
             memory_state_clz=memory_state_clz,
         )
 
-        # norms
-
-        self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
-
         # memory model
 
         if not exists(model):
@@ -93,8 +86,8 @@ class FFNBlock(AssocMemory):
 
         # the memory is the weights of the model
 
-        if mem_model_norm_add_residual:
-            model = ResidualNorm(dim = dim, is_multi_head = is_multi_head, model = model)
+        if normalization:
+            model = NormalizationBuilder(normalization)(dim = dim, is_multi_head = is_multi_head, model = model, **default_model_kwargs)
 
         self.model = model
         
@@ -125,18 +118,10 @@ class FFNBlock(AssocMemory):
 
             out_dim = default_model_kwargs.get('out_dim', test_shape[-1])
             if is_multi_head:
-                assert mem_model_output.shape == (test_shape[0], heads, test_shape[1], out_dim), 'output of memory model needs to be same shape as input'
+                assert mem_model_output.shape == (test_shape[0], heads, test_shape[1], out_dim), f'{self.block_name} output of memory model needs to be same shape as input'
             else:
-                assert mem_model_output.shape == (test_shape[0], test_shape[1], out_dim), 'output of memory model needs to be same shape as input'
+                assert mem_model_output.shape == (test_shape[0], test_shape[1], out_dim), f'{self.block_name} output of memory model needs to be same shape as input'
 
-        # allow for softclamp the gradient norms for storing memories
-
-        self.max_grad_norm = max_grad_norm
-
-        # spectral norming the surprises before update, a la Muon from Jordan et al.
-
-        self.spectral_norm_surprises = spectral_norm_surprises
-        
         # override optimizers - use object.__setattr__ to bypass PyTorch's module registration
         inner_opt = self.inner_optimizer(model = self.model)
         object.__setattr__(self, 'inner_optimizer', inner_opt)
@@ -178,14 +163,10 @@ class FFNBlock(AssocMemory):
             state = self.init_state(state, batch_size=x.shape[0])
         
         fast_weights = state[self.block_name].fast_weights
-        
-        # initial norm
-        
-        queries = self.retrieve_norm(x)
 
         # forward functional call
 
-        logits = functional_call(self.model, dict(fast_weights), (queries,), {'pattern': self.default_pattern})
+        logits = functional_call(self.model, dict(fast_weights), (x,), {'pattern': self.default_pattern})
         
         if not self.is_multi_head:
             logits = inverse_pack(logits)

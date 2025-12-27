@@ -129,7 +129,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_lr=outer_lr,
             is_multi_head=True,
             heads=3,
-            mem_model_norm_add_residual=False,
             default_model_kwargs=k_q_v_kwargs,
         )
         
@@ -151,7 +150,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_lr=outer_lr,
             is_multi_head=False,
             with_bias=True,
-            mem_model_norm_add_residual=False,
+            normalization='pre_norm_only',
             default_model_kwargs=eta_kwargs,
         )
         
@@ -173,7 +172,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_lr=outer_lr,
             is_multi_head=False,
             with_bias=True,
-            mem_model_norm_add_residual=False,
+            normalization='pre_norm_only',
             default_model_kwargs=alpha_kwargs,
         )
         

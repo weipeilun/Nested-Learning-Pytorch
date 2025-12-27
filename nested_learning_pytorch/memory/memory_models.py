@@ -3,13 +3,41 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, Parameter, ParameterList
 
-from einops import rearrange
 from einops import einsum
+
+from typing import Callable
 
 # functions
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
+
+
+class Normalization(Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        
+    def forward(self, x):
+        raise 
+
+class NormalizationBuilder(Callable):
+    def __init__(self, normalization_type: str):
+        self.normalization_type = normalization_type
+        
+    def __call__(self, *args, **kwargs) -> Normalization:
+        if self.normalization_type == 'pre_norm_only':
+            return PreNormOnly(*args, **kwargs)
+        elif self.normalization_type == 'post_norm_only':
+            return PostNormOnly(*args, **kwargs)
+        elif self.normalization_type == 'residual_pre_norm':
+            return ResidualPreNorm(*args, **kwargs)
+        elif self.normalization_type == 'residual_post_norm':
+            return ResidualPostNorm(*args, **kwargs)
+        elif self.normalization_type == 'residual_norm':
+            return ResidualNorm(*args, **kwargs)
+        elif self.normalization_type is None and 'model' in kwargs:
+            return kwargs['model']
+        raise ValueError(f'Invalid normalization type: {self.normalization_type}')
 
 # norms
 
@@ -36,18 +64,108 @@ class LayerNorm(Module):
 
         return self.ln(x) * (gamma + 1.)
 
-# norm + residual wrapper, as used in original TTT paper
-# but could be removed
-
-class ResidualNorm(Module):
+class PreNormOnly(Normalization):
     def __init__(
         self,
         dim,
         model: Module,
-        is_multi_head = False
+        is_multi_head = False,
+        **kwargs
     ):
         super().__init__()
-        self.norm = LayerNorm(dim, is_multi_head=is_multi_head)
+        
+        self.ln = LayerNorm(dim, is_multi_head=is_multi_head)
+        self.model = model
+
+    def forward(self, x, pattern: str | list[str] | None = None):
+        return self.model(self.ln(x), pattern=pattern)
+
+class PostNormOnly(Normalization):
+    def __init__(
+        self,
+        dim,
+        model: Module,
+        is_multi_head = False,
+        out_dim = None,
+        **kwargs
+    ):
+        super().__init__()
+        
+        self.ln = LayerNorm(dim if out_dim is None else out_dim, is_multi_head=is_multi_head)
+        self.model = model
+
+    def forward(self, x, pattern: str | list[str] | None = None):
+        return self.ln(self.model(x, pattern=pattern))
+
+class ResidualPreNorm(Normalization):
+    def __init__(
+        self,
+        dim,
+        model: Module,
+        is_multi_head = False,
+        out_dim = None,
+        **kwargs
+    ):
+        super().__init__()
+        assert out_dim is None or out_dim == dim, "out_dim is not supported for ResidualPreNorm: x can't add with an output with a different dimension"
+        
+        self.ln = LayerNorm(dim, is_multi_head=False)
+        self.model = model
+        
+        self.target_ndim = 4 if is_multi_head else 3
+
+    def forward(self, x, pattern: str | list[str] | None = None):
+
+        out = self.model(self.ln(x), pattern=pattern)
+        
+        if x.ndim != self.target_ndim:
+            expand_dims = self.target_ndim - x.ndim
+            for _ in range(expand_dims):
+                x = x.unsqueeze(1)
+        return x + out
+
+class ResidualPostNorm(Normalization):
+    def __init__(
+        self,
+        dim,
+        model: Module,
+        is_multi_head = False,
+        out_dim = None,
+        **kwargs
+    ):
+        super().__init__()
+        assert out_dim is None or out_dim == dim, "out_dim is not supported for ResidualPostNorm: x can't add with an output with a different dimension"
+        
+        self.ln = LayerNorm(dim if out_dim is None else out_dim, is_multi_head=is_multi_head)
+        self.model = model
+        
+        self.target_ndim = 4 if is_multi_head else 3
+
+    def forward(self, x, pattern: str | list[str] | None = None):
+
+        out = self.model(x, pattern=pattern)
+        
+        if x.ndim != self.target_ndim:
+            expand_dims = self.target_ndim - x.ndim
+            for _ in range(expand_dims):
+                x = x.unsqueeze(1)
+        return self.ln(x + out)
+
+
+# norm + residual wrapper, as used in original TTT paper
+class ResidualNorm(Normalization):
+    def __init__(
+        self,
+        dim,
+        model: Module,
+        is_multi_head = False,
+        out_dim = None,
+        **kwargs
+    ):
+        super().__init__()
+        assert out_dim is None or out_dim == dim, "out_dim is not supported for ResidualNorm: x can't add with an output with a different dimension"
+        
+        self.ln = LayerNorm(dim, is_multi_head=is_multi_head)
         self.model = model
         
         self.target_ndim = 4 if is_multi_head else 3
