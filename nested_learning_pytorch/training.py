@@ -1,15 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict
 
 import torch
+import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from .memory.assoc_memory import AssocMemSpec
 from .model import HOPEModel, ModelConfig
 
+
+LOSS_REGISTRY = {
+    "mse": nn.MSELoss,
+    "l1": nn.L1Loss,
+    "mae": nn.L1Loss,
+    "cross_entropy": nn.CrossEntropyLoss,
+    "nll": nn.NLLLoss,
+    "bce": nn.BCELoss,
+    "bce_with_logits": nn.BCEWithLogitsLoss,
+    "smooth_l1": nn.SmoothL1Loss,
+    "huber": nn.HuberLoss,
+}
+
+
+def get_loss(name: str, **kwargs) -> nn.Module:
+    name = name.lower()
+    if name not in LOSS_REGISTRY:
+        raise ValueError(f"Unknown loss: {name}")
+    return LOSS_REGISTRY[name](**kwargs)
 
 @dataclass
 class DistributedContext:
@@ -29,7 +47,7 @@ def unwrap_config(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
-def create_assoc_mem_spec(config_dict: dict) -> AssocMemSpec:
+def create_assoc_mem_spec(config_dict: dict, inner_loss_fn: nn.Module, outer_loss_fn: nn.Module) -> AssocMemSpec:
     """Create an AssocMemSpec from a config dict, putting unknown fields in extra_params.
     
     Args:
@@ -52,11 +70,15 @@ def create_assoc_mem_spec(config_dict: dict) -> AssocMemSpec:
         if key in standard_fields:
             # Handle nested children_blocks recursively
             if key == 'children_blocks' and value:
-                standard_params[key] = [create_assoc_mem_spec(child) for child in value]
+                standard_params[key] = [create_assoc_mem_spec(child, inner_loss_fn, outer_loss_fn) for child in value]
             else:
                 standard_params[key] = value
         else:
             extra_params[key] = value
+    
+    # add inner_loss_fn and outer_loss_fn to standard_params
+    standard_params['inner_loss_fn'] = inner_loss_fn
+    standard_params['outer_loss_fn'] = outer_loss_fn
     
     # Special handling for FullyAdaptiveTitans: provide default update_period
     block_type = config_dict.get('type', '')
@@ -80,7 +102,9 @@ def build_model_from_cfg(model_cfg: DictConfig) -> torch.nn.Module:
     optimizer_cfg = {}
     if "optimizers" in model_cfg:
         optimizer_cfg = OmegaConf.to_container(model_cfg.optimizers, resolve=True) # type: ignore[arg-type]
-    blocks = [create_assoc_mem_spec(entry) for entry in model_cfg.blocks]
+    inner_loss_fn = get_loss(model_cfg.get("inner_loss_fn", "mse"), reduction='none')
+    outer_loss_fn = get_loss(model_cfg.get("outer_loss_fn", "mse"), reduction='none')
+    blocks = [create_assoc_mem_spec(entry, inner_loss_fn, outer_loss_fn) for entry in model_cfg.blocks]
     hope_cfg = ModelConfig(
         num_tokens=model_cfg.num_tokens,
         dim=model_cfg.dim,
@@ -88,7 +112,7 @@ def build_model_from_cfg(model_cfg: DictConfig) -> torch.nn.Module:
         blocks=blocks,
         optimizers=optimizer_cfg,
         gradient_checkpointing=model_cfg.get("gradient_checkpointing", False),
-        surprise_threshold=model_cfg.get("surprise_threshold", None),
         freeze_backbone=model_cfg.get("freeze_backbone", False),
+        is_training=model_cfg.get("is_training", True),
     )
-    return HOPEModel(hope_cfg)
+    return HOPEModel(hope_cfg, inner_loss_fn, outer_loss_fn)

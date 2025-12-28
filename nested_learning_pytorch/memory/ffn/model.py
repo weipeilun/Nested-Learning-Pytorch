@@ -35,9 +35,6 @@ u - key / value updates - allowing a token to emit multiple key / values
 # MLPs, linear layers, etc.) and the objective is optimized with gradient descent or Newton's methods.
 
 
-def default_loss_fn(pred, target):
-    return (pred - target).pow(2).mean(dim = -1)
-
 class FFNBlock(AssocMemory):
     """FFN Block implementation with automatic registration."""
     
@@ -53,8 +50,8 @@ class FFNBlock(AssocMemory):
         outer_optimizer: Callable | tuple[Callable, Callable],
         inner_lr: float,
         outer_lr: float,
-        inner_loss_fn: Callable = default_loss_fn,
-        outer_loss_fn: Callable = default_loss_fn,
+        inner_loss_fn: nn.Module,
+        outer_loss_fn: nn.Module,
         memory_state_clz: type | None = None,
         model: Module | None = None,
         is_multi_head = False,

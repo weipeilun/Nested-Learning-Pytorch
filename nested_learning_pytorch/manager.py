@@ -158,6 +158,8 @@ class FrequencyManager:
                     update_period=update_period,
                     warmup_steps=0,
                     jitter=0,
+                    inner_loss_fn=None,
+                    outer_loss_fn=None,
                 )
     
     def get_frequency(self, block_name: str) -> int:

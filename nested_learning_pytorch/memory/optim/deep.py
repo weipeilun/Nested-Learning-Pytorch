@@ -16,11 +16,7 @@ from einops import rearrange
 from ..assoc_memory import AssocMemory, AssocMemState
 from ...utils import default, repeat_dict_values, pack_one_with_inverse
 
-from ..memory_models import MemoryMLP, ResidualNorm
-
-
-def default_loss_fn(pred, target):
-    return (pred - target).pow(2).mean(dim = -1)
+from ..memory_models import MemoryMLP
 
 
 class DeepMomentumGradientDesent(AssocMemory):
@@ -43,8 +39,8 @@ class DeepMomentumGradientDesent(AssocMemory):
         inner_lr: float,
         outer_lr: float,
         params: dict[str, torch.Tensor],
-        inner_loss_fn: Callable = default_loss_fn,
-        outer_loss_fn: Callable = default_loss_fn,
+        inner_loss_fn: nn.Module,
+        outer_loss_fn: nn.Module,
         memory_state_clz: type | None = DeepMomentumGradientDesentState,
         model: Module | None = None,
         alpha: float = 0.1,

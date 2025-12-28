@@ -14,7 +14,9 @@ model:
   num_tokens: 64
   dim: 32
   num_layers: 2
-  is_training: false
+  is_training: true
+  inner_loss_fn: mse
+  outer_loss_fn: mse
   blocks:
     - name: memory_slow
       type: FFN

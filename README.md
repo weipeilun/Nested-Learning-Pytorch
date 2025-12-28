@@ -40,16 +40,16 @@ See `configs/hope_tiny.yaml` for an example slow→mid→fast→Titans stack and
     url     = {https://neurips.cc/virtual/2025/loc/san-diego/poster/116123}
 }
 
-@inproceedings{Behrouz2024TitansLT,
+@inproceedings{Behrouz2024Titans,
     title   = {Titans: Learning to Memorize at Test Time},
     author  = {Ali Behrouz and Peilin Zhong and Vahab S. Mirrokni},
     year    = {2024},
     url     = {https://arxiv.org/pdf/2501.00663}
 }
 
-@inproceedings{Yang2024GatedDN,
-    title   = {Gated Delta Networks: Improving Mamba2 with Delta Rule},
-    author  = {Songlin Yang and Jan Kautz and Ali Hatamizadeh},
+@inproceedings{Behrouz2024Miras,
+    title   = {It's All Connected: A Journey Through Test-Time Memorization, Attentional Bias, Retention, and Online Optimization},
+    author  = {Ali Behrouz and Meisam Razaviyayn and Peilin Zhong and Vahab Mirrokni},
     year    = {2024},
     url     = {https://arxiv.org/pdf/2504.13173}
 }

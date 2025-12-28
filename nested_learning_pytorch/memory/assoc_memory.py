@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from functools import wraps
 
 from typing import Callable, Any
-
+import warnings
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_map
@@ -14,7 +14,11 @@ from tensordict import TensorDict
 from .factory import _ASSOC_MEMORY_REGISTRY
 from .optim.factory import build_inner_optimizer, build_outer_optimizer
 
-from ..utils import repeat_dict_values, default, safe_cat
+from ..utils import repeat_dict_values, default
+
+
+DEFAULT_INNER_OPTIMIZER_SUF = '_inner_optimizer'
+DEFAULT_OUTER_OPTIMIZER_SUF = '_outer_optimizer'
 
 
 def update_step(forward_fn):
@@ -44,8 +48,14 @@ def update_step(forward_fn):
     return wrapper
 
 
-def default_loss_fn(pred, target):
-    return (pred - target).pow(2).mean(dim = -1)
+def is_optimizer_block(block_name: str) -> bool:
+    return is_inner_optimizer_block(block_name) or is_outer_optimizer_block(block_name)
+
+def is_inner_optimizer_block(block_name: str) -> bool:
+    return block_name.endswith(DEFAULT_INNER_OPTIMIZER_SUF)
+
+def is_outer_optimizer_block(block_name: str) -> bool:
+    return block_name.endswith(DEFAULT_OUTER_OPTIMIZER_SUF)
 
 
 class AssocMemory(nn.Module):
@@ -53,6 +63,8 @@ class AssocMemory(nn.Module):
     
     # Class attribute to enable automatic registration
     _type_name: str | None = None
+    
+    DEFAULT_GRADIENT_KEY_SPLITTER = '::'
     
     def __init_subclass__(cls, **kwargs):
         """Automatically register subclasses if they have a _type_name attribute.
@@ -83,8 +95,8 @@ class AssocMemory(nn.Module):
                  dim: int | None,
                  inner_lr: float,
                  outer_lr: float,
-                 inner_loss_fn: Callable = default_loss_fn,
-                 outer_loss_fn: Callable = default_loss_fn,
+                 inner_loss_fn: nn.Module,
+                 outer_loss_fn: nn.Module,
                  memory_state_clz: type | None = None
                  ): 
         super().__init__()
@@ -130,49 +142,81 @@ class AssocMemory(nn.Module):
     @update_step
     def forward(self, x, state: dict[str, AssocMemState] | None = None) -> tuple[torch.Tensor, dict[str, AssocMemState]]:  # type: ignore[override]
         raise NotImplementedError
+    
+    def add_calcuable_fast_weights(
+        self, 
+        fast_weight_dict: dict[str, torch.Tensor] | None, 
+        memory_block_name: str,
+        fast_weight_keys: list[str],
+        fast_weight_values: list[torch.Tensor]
+    ) -> None:
+        """Helper method to add fast weights from a memory block to the accumulator lists."""
+        if fast_weight_dict is not None:
+            for key, value in fast_weight_dict.items():
+                fast_weight_keys.append(f"{memory_block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
+                fast_weight_values.append(value)
+    
+    def get_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
+        fast_weight_keys: list[str] = []
+        fast_weight_values: list[torch.Tensor] = []
+        
+        self.add_calcuable_fast_weights(state[self.block_name].fast_weights, self.block_name, fast_weight_keys, fast_weight_values)
+        
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_calcuable_fast_weights(state=state)
+                fast_weight_keys.extend(child_block_keys)
+                fast_weight_values.extend(child_block_values)
+        
+        return fast_weight_keys, fast_weight_values
                 
     # calculate the sum of gradients across sequence dimension for each block and sum to state.updates
-    def cal_inner_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor, losses: torch.Tensor | None = None) -> None:
+    def cal_inner_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor, block_grads_dict: dict[str, torch.Tensor]) -> None:
         if hasattr(self, 'model') and self.model is not None:
             fast_weights = state[self.block_name].fast_weights
             updates = state[self.block_name].updates
             
-            with torch.enable_grad():
-                losses = default(losses, self.inner_loss_fn(logits, y))
-                
-                # We multiply the loss by the learning rate here.
-                losses = losses * self.inner_lr
-                
-                fast_weight_keys = []
-                fast_weight_values = []
-                for fast_weight_name, fast_weight_value in fast_weights.items():
-                    fast_weight_keys.append(fast_weight_name)
-                    fast_weight_values.append(fast_weight_value)
-                
-                # Compute gradients with respect to fast_weights
-                # We need to compute the second order gradients in higher levels, so we need to set retain_graph and create_graph to True
-                # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
-                # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
-                # levels (or outer-loop)."
-                # We sum the batch dimension of the loss to avoid the division by the number of tasks, which is not expected in meta learning.
-                grads = torch.autograd.grad(
-                    outputs=losses.sum(dim=1).mean(dim=0),
-                    inputs=fast_weight_values,
-                    retain_graph=True,
-                    create_graph=True,
-                )
-                
-                new_updates = {}
-                for fast_weight_key, grad in zip(fast_weight_keys, grads, strict=True): 
-                    # add to historic gradients
-                    if grad is not None:
-                        if updates is not None:
-                            new_updates[fast_weight_key] = updates[fast_weight_key] + grad
-                        else:
-                            new_updates[fast_weight_key] = grad
-            
-                if new_updates:
-                    state[self.block_name].updates = new_updates
+            if self.block_name in block_grads_dict:
+                grads_dict = block_grads_dict[self.block_name]
+                    
+                key_grads_iter = grads_dict.items()
+            else:
+                warnings.warn(f"Autometically calculating gradients for {self.block_name} failed, please check the gradient flow.")
+                with torch.enable_grad():
+                    losses = self.inner_loss_fn(logits, y)
+                    
+                    fast_weight_keys = []
+                    fast_weight_values = []
+                    for fast_weight_name, fast_weight_value in fast_weights.items():
+                        fast_weight_keys.append(fast_weight_name)
+                        fast_weight_values.append(fast_weight_value)
+                    
+                    # Compute gradients with respect to fast_weights
+                    # We need to compute the second order gradients in higher levels, so we need to set retain_graph and create_graph to True
+                    # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
+                    # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
+                    # levels (or outer-loop)."
+                    # We sum the batch dimension of the loss to avoid the division by the number of tasks, which is not expected in meta learning.
+                    grads = torch.autograd.grad(
+                        outputs=losses.sum(dim=1).mean(dim=0),
+                        inputs=fast_weight_values,
+                        retain_graph=True,
+                        create_graph=True,
+                    )
+                    
+                    key_grads_iter = zip(fast_weight_keys, grads, strict=True)
+                    
+            new_updates = {}
+            for fast_weight_key, grad in key_grads_iter: 
+                # add to historic gradients
+                if grad is not None:
+                    if updates is not None:
+                        new_updates[fast_weight_key] = updates[fast_weight_key] + grad
+                    else:
+                        new_updates[fast_weight_key] = grad
+        
+            if new_updates:
+                state[self.block_name].updates = new_updates
                 
                 # # check gradients towards weights
                 # weights = state[self.block_name].weights
@@ -188,7 +232,7 @@ class AssocMemory(nn.Module):
                 
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.cal_inner_grads(logits=logits, state=state, y=y)
+                child_block.cal_inner_grads(logits=logits, state=state, y=y, block_grads_dict=block_grads_dict)
 
     def inner_update(self, state: dict[str, AssocMemState]) -> bool:
         updated = False
@@ -398,8 +442,8 @@ def _build_block(spec: AssocMemSpec, optimizer_configs: Dict[str, dict], dim: in
         'outer_optimizer': None,
         'inner_lr': spec.inner_lr,
         'outer_lr': spec.outer_lr,
-        'inner_loss_fn': default_loss_fn,
-        'outer_loss_fn': default_loss_fn,
+        'inner_loss_fn': spec.inner_loss_fn,
+        'outer_loss_fn': spec.outer_loss_fn,
         **extra_params,  # Add all extra custom parameters
         **kwargs
     }
@@ -412,8 +456,8 @@ def _build_block(spec: AssocMemSpec, optimizer_configs: Dict[str, dict], dim: in
     params_inner_optimizer = params_base.copy()
     params_outer_optimizer = params_base.copy()
     
-    params_inner_optimizer['block_name'] = f"{spec.name}_inner_optimizer"
-    params_outer_optimizer['block_name'] = f"{spec.name}_outer_optimizer"
+    params_inner_optimizer['block_name'] = f"{spec.name}{DEFAULT_INNER_OPTIMIZER_SUF}"
+    params_outer_optimizer['block_name'] = f"{spec.name}{DEFAULT_OUTER_OPTIMIZER_SUF}"
     inner_optimizer = build_inner_optimizer(memory_type, optimizer_configs=optimizer_configs, params=params_inner_optimizer)
     outer_optimizer = build_outer_optimizer(memory_type, optimizer_configs=optimizer_configs, params=params_outer_optimizer)
     
@@ -453,10 +497,6 @@ def _ensure_subclasses_imported():
         raise ImportError(f"AssocMemory subclasses not found. Please ensure all AssocMemory subclasses are imported. Error: {e}")
 
 
-class SupportsReset(Protocol):
-    def reset_state(self) -> None:
-        ...
-
 @dataclass
 class AssocMemState:
     last_update_step: torch.Tensor | int = -1  # shape: (batch_size,) or scalar
@@ -480,6 +520,8 @@ class AssocMemSpec:
     name: str
     type: str
     update_period: int
+    inner_loss_fn: nn.Module
+    outer_loss_fn: nn.Module
     warmup_steps: int = 0
     jitter: int = 0
     inner_lr: float = 1.0e-4

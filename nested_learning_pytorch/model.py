@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from turtle import write_docstringdict
 from typing import Dict, Sequence
 
 import torch
@@ -8,7 +9,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from .memory.hope.model import HOPEBlock, HOPEBlockConfig
-from .memory.assoc_memory import AssocMemState, AssocMemSpec
+from .memory.assoc_memory import AssocMemState, AssocMemSpec, AssocMemory
 from .manager import FrequencyManager
 
 from .utils import pack_one_with_inverse, safe_cat
@@ -22,21 +23,25 @@ class ModelConfig:
     blocks: Sequence[AssocMemSpec]
     optimizers: Dict[str, dict] | None = None
     gradient_checkpointing: bool = False
-    surprise_threshold: float | None = None
     freeze_backbone: bool = False
     is_training: bool = True
+    inner_loss_fn: str = 'mse'
+    outer_loss_fn: str = 'mse'
 
 
 class HOPEModel(nn.Module):
-    def __init__(self, config: ModelConfig):
+    
+    def __init__(self, config: ModelConfig, inner_loss_fn: nn.Module, outer_loss_fn: nn.Module):
         super().__init__()
         self.config = config
+        self.inner_loss_fn = inner_loss_fn
+        self.outer_loss_fn = outer_loss_fn
         self.gradient_checkpointing = config.gradient_checkpointing
-        self._surprise_threshold = config.surprise_threshold
-        self._allowed_update_blocks: set[str] | None = None
         block_config = HOPEBlockConfig(
             dim=config.dim,
             blocks=config.blocks,
+            inner_loss_fn=inner_loss_fn,
+            outer_loss_fn=outer_loss_fn,
             optimizer_configs=config.optimizers or {},
         )
         self.blocks = nn.ModuleList([HOPEBlock(f'hope_{i}', block_config) for i in range(config.num_layers)])
@@ -54,28 +59,6 @@ class HOPEModel(nn.Module):
         # whether to update the fast_weights of the blocks
         # this is actually the switch to obtain information from the environment in realtime, making it a "streaming information system" or a traditional AI model
         self.inner_training = config.is_training
-
-    def set_teach_runtime(self, *, scale: float | None = None, clip: float | None = None) -> None:
-        if scale is not None:
-            self._runtime_teach_scale = scale
-        if clip is not None:
-            self._runtime_teach_clip = clip
-
-    def set_surprise_threshold(self, threshold: float | None) -> None:
-        self._surprise_threshold = threshold
-        for block in self.blocks:
-            block.set_surprise_threshold(threshold)
-
-    def get_surprise_threshold(self) -> float | None:
-        return self._surprise_threshold
-
-    def set_allowed_update_blocks(self, blocks: set[str] | None) -> None:
-        self._allowed_update_blocks = blocks.copy() if blocks is not None else None
-        for block in self.blocks:
-            block.set_allowed_blocks(self._allowed_update_blocks)
-
-    def get_allowed_update_blocks(self) -> set[str] | None:
-        return None if self._allowed_update_blocks is None else self._allowed_update_blocks.copy()
     
     def check_identical_step(self, state: dict[str, AssocMemState]) -> bool:
         """Check that all step values in all batch items are identical across all states.
@@ -156,11 +139,15 @@ class HOPEModel(nn.Module):
         logits = self.to_logits(seq)
         
         # calculate gradients for each block
+        if self.inner_training:
+            block_grads_dict = self.cal_inner_grads_all_at_once(logits=logits, state=state, y=y[:, start_step:seq_end_step, :])
+        else:
+            block_grads_dict = self.cal_inner_grads_all_at_once(logits=logits, state=state, y=logits)
         for block in self.blocks:
             if self.inner_training:
-                block.cal_inner_grads(logits=logits, state=state, y=y[:, start_step:seq_end_step, :])
+                block.cal_inner_grads(logits=logits, state=state, y=y[:, start_step:seq_end_step, :], block_grads_dict=block_grads_dict)
             else:
-                block.cal_inner_grads(logits=logits, state=state, y=logits)
+                block.cal_inner_grads(logits=logits, state=state, y=logits, block_grads_dict=block_grads_dict)
         
         # update fast_weights if needed
         for block in self.blocks:
@@ -215,6 +202,47 @@ class HOPEModel(nn.Module):
             
         for block in self.blocks:
             block.optimize()
+    
+    # calculate all fast weights' gradients once rather than in each block, or there will be a lot of redundant calculations and gradients maps kept in GPU memory
+    def cal_inner_grads_all_at_once(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor) -> None:
+        
+        block_grad_dict = {}
+        
+        # get fast weights from state
+        block_weight_keys_list: list[str] = []
+        block_weight_values_list: list[torch.Tensor] = []
+        for block in self.blocks:
+            block_weight_keys, block_weight_values = block.get_calcuable_fast_weights(state=state)
+            block_weight_keys_list.extend(block_weight_keys)
+            block_weight_values_list.extend(block_weight_values)
+        
+        assert len(block_weight_keys_list) == len(block_weight_values_list), "block_weight_keys_list and block_weight_values_list must have the same length"
+        
+        if len(block_weight_keys_list) == 0:
+            return block_grad_dict
+        
+        with torch.enable_grad():
+            losses = self.inner_loss_fn(logits, y)
+            
+            # Compute gradients with respect to fast_weights
+            # We need to compute the second order gradients in higher levels, so we need to set retain_graph and create_graph to True
+            # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
+            # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
+            # levels (or outer-loop)."
+            # We sum the batch dimension of the loss to avoid the division by the number of tasks, which is not expected in meta learning.
+            grads = torch.autograd.grad(
+                outputs=losses.mean(dim=2).mean(dim=1).sum(dim=0),
+                inputs=block_weight_values_list,
+                retain_graph=True,
+                create_graph=True,
+            )
+            
+            for block_weight_key, grad in zip(block_weight_keys_list, grads, strict=True):
+                block_name, grad_key = block_weight_key.split(AssocMemory.DEFAULT_GRADIENT_KEY_SPLITTER)
+                if block_name not in block_grad_dict:
+                    block_grad_dict[block_name] = {}
+                block_grad_dict[block_name][grad_key] = grad
+        return block_grad_dict
 
     def _gather_block_stats(self) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
