@@ -43,7 +43,8 @@ class DeepMomentumGradientDesent(AssocMemory):
         outer_loss_fn: nn.Module,
         memory_state_clz: type | None = DeepMomentumGradientDesentState,
         model: Module | None = None,
-        alpha: float = 0.1,
+        alpha: float = 0.9,
+        eta: float = 0.1,
         max_grad_norm: float | None = None,
         spectral_norm_surprises = False,
         mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
@@ -96,6 +97,7 @@ class DeepMomentumGradientDesent(AssocMemory):
         
         # Define eta and alpha as non-learnable constants.
         self.register_buffer('alpha', torch.tensor([alpha], dtype=torch.float32))
+        self.register_buffer('eta', torch.tensor([eta], dtype=torch.float32))
         self.optimizer_key_idx_map = {name: idx for idx, name in enumerate(self.get_optimizer_params().keys())}
         
         # override optimizers - use object.__setattr__ to bypass PyTorch's module registration
@@ -198,13 +200,11 @@ class DeepMomentumGradientDesent(AssocMemory):
             preconditioner_fast_weight_update[preconditioner_fast_weight_key] = preconditioner_fast_weight_value + preconditioner_grad * (-1)
         return TensorDict(preconditioner_fast_weight_update)
     
-    def cal_inner_grads_update(self, grads_dict: torch.Tensor, state: dict[str, AssocMemState], alpha: torch.Tensor | None = None, eps: float = 1e-6) -> None:
+    def cal_inner_grads_update(self, grads_dict: torch.Tensor, state: dict[str, AssocMemState], eps: float = 1e-6) -> None:
         updated = False
         if hasattr(self, 'model') and self.model is not None:
             fast_weights = state[self.block_name].fast_weights
             momentum = state[self.block_name].momentum
-            
-            alpha = default(alpha, self.alpha)
             
             with torch.enable_grad():
                 fast_weights_updated = {}
@@ -279,17 +279,16 @@ class DeepMomentumGradientDesent(AssocMemory):
                     for optimizer_fast_weight_key, optimizer_fast_weight_grad in zip(optimizer_fast_weight_keys, optimizer_fast_weight_grads, strict=True):
                         tmp_weight_key = f'{self.param_name_mapping[grad_name]}.{optimizer_fast_weight_key}'
                         
-                        # When a multi-head mlp meets a multi-weighted alpha, it could be issue with the weight dimension. But since FullyAdditiveTitansBlock.titans_memory is not multi-headed, we will be fine.
-                        if alpha.ndim == 2:
-                            alpha_unsqueezed = alpha[:, self.optimizer_key_idx_map[tmp_weight_key]]
-                        else:
-                            alpha_unsqueezed = alpha
+                        alpha_unsqueezed = self.alpha
                         while alpha_unsqueezed.ndim != optimizer_fast_weight_grad.ndim:
                             alpha_unsqueezed = alpha_unsqueezed.unsqueeze(-1)
+                        eta_unsqueezed = self.eta
+                        while eta_unsqueezed.ndim != optimizer_fast_weight_grad.ndim:
+                            eta_unsqueezed = eta_unsqueezed.unsqueeze(-1)
                             
                         # Equation 50
                         # alpha is initialized near 1, and optimizer_fast_weight_grad is already weighted by eta
-                        momentum_updated[tmp_weight_key] = momentum[tmp_weight_key] * alpha_unsqueezed - optimizer_fast_weight_grad
+                        momentum_updated[tmp_weight_key] = momentum[tmp_weight_key] * alpha_unsqueezed - optimizer_fast_weight_grad * eta_unsqueezed
                         fast_weights_updated[tmp_weight_key] = fast_weights[tmp_weight_key] + momentum_updated[tmp_weight_key]
                     
                     if need_pack:

@@ -49,7 +49,9 @@ class FullyAdditiveTitansBlock(AssocMemory):
         alpha: torch.Tensor | None = None
         last_alpha_fast_weight: torch.Tensor | None = None
         last_eta_fast_weight: torch.Tensor | None = None
-        last_k_q_v_fast_weight: torch.Tensor | None = None
+        last_q_fast_weight: torch.Tensor | None = None
+        last_k_fast_weight: torch.Tensor | None = None
+        last_v_fast_weight: torch.Tensor | None = None
         last_step_updated: bool = False
         
     def __init__(
@@ -108,28 +110,72 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_lr=outer_lr,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
+            normalization=None,
             memory_state_clz=self.TitansState,
             default_model_kwargs=default_model_kwargs,
         )
         
-        k_q_v_optimizer = inner_optimizer.clone()
-        k_q_v_optimizer.kwargs['chunk_size'] = k_q_v_optimizer.kwargs.pop('chunk_size_adaptive')
-        k_q_v_optimizer.kwargs.pop('chunk_size_titans')
-        k_q_v_block_name = f'{self.block_name}_k_q_v'
-        k_q_v_optimizer.kwargs['block_name'] = f'{k_q_v_block_name}_inner_optimizer'
-        k_q_v_kwargs = default_model_kwargs.copy()
-        k_q_v_kwargs['depth'] = 1
-        self.k_q_v_memories = FFNBlock(
-            block_name=k_q_v_block_name,
+        q_optimizer = inner_optimizer.clone()
+        q_optimizer.kwargs['chunk_size'] = q_optimizer.kwargs.pop('chunk_size_adaptive')
+        q_optimizer.kwargs.pop('chunk_size_titans')
+        q_block_name = f'{self.block_name}_q'
+        q_optimizer.kwargs['block_name'] = f'{q_block_name}_inner_optimizer'
+        q_kwargs = default_model_kwargs.copy()
+        q_kwargs['depth'] = 1
+        self.q_memory = FFNBlock(
+            block_name=q_block_name,
             chunk_size=chunk_size_adaptive,
             dim=dim,
-            inner_optimizer=k_q_v_optimizer,
+            inner_optimizer=q_optimizer,
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
-            default_model_kwargs=k_q_v_kwargs,
+            normalization=None,
+            default_model_kwargs=q_kwargs,
+        )
+        
+        k_optimizer = inner_optimizer.clone()
+        k_optimizer.kwargs['chunk_size'] = k_optimizer.kwargs.pop('chunk_size_adaptive')
+        k_optimizer.kwargs.pop('chunk_size_titans')
+        k_block_name = f'{self.block_name}_k'
+        k_optimizer.kwargs['block_name'] = f'{k_block_name}_inner_optimizer'
+        k_kwargs = default_model_kwargs.copy()
+        k_kwargs['depth'] = 1
+        self.k_memory = FFNBlock(
+            block_name=k_block_name,
+            chunk_size=chunk_size_adaptive,
+            dim=dim,
+            inner_optimizer=k_optimizer,
+            outer_optimizer=outer_optimizer,
+            inner_lr=inner_lr,
+            outer_lr=outer_lr,
+            inner_loss_fn=inner_loss_fn,
+            outer_loss_fn=outer_loss_fn,
+            normalization=None,
+            default_model_kwargs=k_kwargs,
+        )
+        
+        v_optimizer = inner_optimizer.clone()
+        v_optimizer.kwargs['chunk_size'] = v_optimizer.kwargs.pop('chunk_size_adaptive')
+        v_optimizer.kwargs.pop('chunk_size_titans')
+        v_block_name = f'{self.block_name}_v'
+        v_optimizer.kwargs['block_name'] = f'{v_block_name}_inner_optimizer'
+        v_kwargs = default_model_kwargs.copy()
+        v_kwargs['depth'] = 1
+        self.v_memory = FFNBlock(
+            block_name=v_block_name,
+            chunk_size=chunk_size_adaptive,
+            dim=dim,
+            inner_optimizer=v_optimizer,
+            outer_optimizer=outer_optimizer,
+            inner_lr=inner_lr,
+            outer_lr=outer_lr,
+            inner_loss_fn=inner_loss_fn,
+            outer_loss_fn=outer_loss_fn,
+            normalization=None,
+            default_model_kwargs=v_kwargs,
         )
         
         eta_optimizer = inner_optimizer.clone()
@@ -138,7 +184,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
         eta_block_name = f'{self.block_name}_eta'
         eta_optimizer.kwargs['block_name'] = f'{eta_block_name}_inner_optimizer'
         eta_kwargs = default_model_kwargs.copy()
-        eta_kwargs['depth'] = 1
         eta_kwargs['out_dim'] = 1
         self.eta_memory = FFNBlock(
             block_name=eta_block_name,
@@ -152,7 +197,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_loss_fn=outer_loss_fn,
             is_multi_head=False,
             with_bias=True,
-            normalization='pre_norm_only',
+            normalization=None,
             default_model_kwargs=eta_kwargs,
         )
         
@@ -162,7 +207,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
         alpha_block_name = f'{self.block_name}_alpha'
         alpha_optimizer.kwargs['block_name'] = f'{alpha_block_name}_inner_optimizer'
         alpha_kwargs = default_model_kwargs.copy()
-        alpha_kwargs['depth'] = 1
         alpha_kwargs['out_dim'] = 1
         self.alpha_memory = FFNBlock(
             block_name=alpha_block_name,
@@ -176,7 +220,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_loss_fn=outer_loss_fn,
             is_multi_head=False,
             with_bias=True,
-            normalization='pre_norm_only',
+            normalization=None,
             default_model_kwargs=alpha_kwargs,
         )
         
@@ -227,7 +271,9 @@ class FullyAdditiveTitansBlock(AssocMemory):
         return {
             self.eta_memory.block_name: self.chunk_size_adaptive,
             self.alpha_memory.block_name: self.chunk_size_adaptive,
-            self.k_q_v_memories.block_name: self.chunk_size_adaptive,
+            self.q_memory.block_name: self.chunk_size_adaptive,
+            self.k_memory.block_name: self.chunk_size_adaptive,
+            self.v_memory.block_name: self.chunk_size_adaptive,
             self.titans_memory.block_name: self.chunk_size_titans,
         }
         
@@ -244,23 +290,25 @@ class FullyAdditiveTitansBlock(AssocMemory):
             elif len(self.children_blocks) > 0:
                 x, state = self.children_blocks[0](x=x, state=state)
         
-        # pack into batch dimension
-        
-        x, inverse_pack = pack_one_with_inverse(x, '* l d')
-        
         # handle previous state init
 
         if state is None:
             state = self.init_state(state, batch_size=x.shape[0])
             
-        k_q_v_logits, state = self.k_q_v_memories(x=x, state=state)
+        x_normed = self.retrieve_norm(x)
         
-        k, v, q = k_q_v_logits.unbind(dim=1)
+        # pack into batch dimension
         
-        eta_logits, state = self.eta_memory(x=x, state=state)
+        x_normed, inverse_pack = pack_one_with_inverse(x_normed, '* l d')
+            
+        q, state = self.q_memory(x=x_normed, state=state)
+        k, state = self.k_memory(x=x_normed, state=state)
+        v, state = self.v_memory(x=x_normed, state=state)
+        
+        eta_logits, state = self.eta_memory(x=x_normed, state=state)
         eta = eta_logits.sigmoid().squeeze(dim=-1)
         
-        alpha_logits, state = self.alpha_memory(x=x, state=state)
+        alpha_logits, state = self.alpha_memory(x=x_normed, state=state)
         alpha = alpha_logits.sigmoid().squeeze(dim=-1)
         
         titans_logits, state = self.titans_memory(x=q, state=state)
@@ -274,7 +322,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         
         titans_logits = inverse_pack(titans_logits, '* l d')
 
-        return titans_logits, state
+        return titans_logits + x, state
     
     def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
         if state is None:
@@ -282,8 +330,14 @@ class FullyAdditiveTitansBlock(AssocMemory):
         
         batch_size = default(batch_size, 1)
         
-        if self.k_q_v_memories.block_name not in state:
-            self.k_q_v_memories.init_state(state=state, batch_size=batch_size)
+        if self.q_memory.block_name not in state:
+            self.q_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.k_memory.block_name not in state:
+            self.k_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.v_memory.block_name not in state:
+            self.v_memory.init_state(state=state, batch_size=batch_size)
             
         if self.eta_memory.block_name not in state:
             self.eta_memory.init_state(state=state, batch_size=batch_size)
@@ -307,9 +361,11 @@ class FullyAdditiveTitansBlock(AssocMemory):
         # t - 1's titans calcuable fast weights is not added to graph util t, so we need to get the t - 1's fast weights, that is the fast weights in caches
         titans_state = state[self.titans_memory.block_name]
         
-        self.add_calcuable_fast_weights(titans_state.last_eta_fast_weight, self.eta_memory.block_name, fast_weight_keys, fast_weight_values)
-        self.add_calcuable_fast_weights(titans_state.last_k_q_v_fast_weight, self.k_q_v_memories.block_name, fast_weight_keys, fast_weight_values)
+        self.add_calcuable_fast_weights(titans_state.last_q_fast_weight, self.q_memory.block_name, fast_weight_keys, fast_weight_values)
+        self.add_calcuable_fast_weights(titans_state.last_k_fast_weight, self.k_memory.block_name, fast_weight_keys, fast_weight_values)
+        self.add_calcuable_fast_weights(titans_state.last_v_fast_weight, self.v_memory.block_name, fast_weight_keys, fast_weight_values)
         self.add_calcuable_fast_weights(titans_state.last_alpha_fast_weight, self.alpha_memory.block_name, fast_weight_keys, fast_weight_values)
+        self.add_calcuable_fast_weights(titans_state.last_eta_fast_weight, self.eta_memory.block_name, fast_weight_keys, fast_weight_values)
         
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
@@ -365,7 +421,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             # Update the optimizer first then use it to optimize the Titans memory.
             # It's important to update the optimizer first, otherwise will lead to a suboptimal result.
             # Both instinctly and according to equation 50 in NL paper.
-            self.titans_memory.inner_optimizer.cal_inner_grads_update(grads_dict=titans_grads_dict, state=state, alpha=alpha)
+            self.titans_memory.inner_optimizer.cal_inner_grads_update(grads_dict=titans_grads_dict, state=state)
 
             titans_grads_dict_optimized, state = self.titans_memory.inner_optimizer(x=titans_grads_dict, state=state)
             
@@ -374,8 +430,12 @@ class FullyAdditiveTitansBlock(AssocMemory):
             #     print(f"Weight {weight_key} gradient: {weight_grad.norm().item()}")
             
             new_titans_fast_weights = {}
-            for (titans_fast_weight_key, titans_grad_optimized), titans_fast_weight_value in zip(titans_grads_dict_optimized.items(), titans_fast_weight_values, strict=True):
-                new_titans_fast_weights[titans_fast_weight_key] = titans_fast_weight_value + titans_grad_optimized * (-self.inner_lr)
+            for (titans_fast_weight_key, titans_grad_optimized), titans_fast_weight_value in zip(titans_grads_dict_optimized.items(), titans_fast_weight_values, strict=True):                        
+                alpha_unsqueezed = alpha
+                while alpha_unsqueezed.ndim != titans_fast_weight_value.ndim:
+                    alpha_unsqueezed = alpha_unsqueezed.unsqueeze(-1)
+                    
+                new_titans_fast_weights[titans_fast_weight_key] = titans_fast_weight_value * alpha_unsqueezed - titans_grad_optimized
             
             titans_state.fast_weights = new_titans_fast_weights
             
@@ -387,17 +447,23 @@ class FullyAdditiveTitansBlock(AssocMemory):
             state[self.titans_memory.inner_optimizer.block_name].last_update_step = titans_state.step.clone()
         
             # The alpha gradient can only be computed using the fast weights at step t-1.
-            if titans_state.last_k_q_v_fast_weight is not None and titans_state.last_alpha_fast_weight is not None and titans_state.last_eta_fast_weight is not None:
-                self.k_q_v_memories.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
+            if titans_state.last_q_fast_weight is not None and titans_state.last_k_fast_weight is not None and titans_state.last_v_fast_weight is not None and titans_state.last_alpha_fast_weight is not None and titans_state.last_eta_fast_weight is not None:
+                self.q_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
+                self.k_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
+                self.v_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
                 self.eta_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
                 self.alpha_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
 
                 if titans_state.last_step_updated:
-                    titans_state.last_k_q_v_fast_weight = state[self.k_q_v_memories.block_name].fast_weights
+                    titans_state.last_q_fast_weight = state[self.q_memory.block_name].fast_weights
+                    titans_state.last_k_fast_weight = state[self.k_memory.block_name].fast_weights
+                    titans_state.last_v_fast_weight = state[self.v_memory.block_name].fast_weights
                     titans_state.last_alpha_fast_weight = state[self.alpha_memory.block_name].fast_weights
                     titans_state.last_eta_fast_weight = state[self.eta_memory.block_name].fast_weights
             else:
-                titans_state.last_k_q_v_fast_weight = state[self.k_q_v_memories.block_name].fast_weights
+                titans_state.last_q_fast_weight = state[self.q_memory.block_name].fast_weights
+                titans_state.last_k_fast_weight = state[self.k_memory.block_name].fast_weights
+                titans_state.last_v_fast_weight = state[self.v_memory.block_name].fast_weights
                 titans_state.last_alpha_fast_weight = state[self.alpha_memory.block_name].fast_weights
                 titans_state.last_eta_fast_weight = state[self.eta_memory.block_name].fast_weights
         
@@ -406,7 +472,9 @@ class FullyAdditiveTitansBlock(AssocMemory):
                 child_block.cal_inner_grads(logits=logits, state=state, y=y, block_grads_dict=block_grads_dict)
                 
     def inner_update(self, state: dict[str, AssocMemState]) -> None:
-        self.k_q_v_memories.inner_update(state=state)
+        self.q_memory.inner_update(state=state)
+        self.k_memory.inner_update(state=state)
+        self.v_memory.inner_update(state=state)
         self.alpha_memory.inner_update(state=state)
         is_updated = self.eta_memory.inner_update(state=state)
         state[self.titans_memory.block_name].last_step_updated = is_updated
@@ -422,7 +490,9 @@ class FullyAdditiveTitansBlock(AssocMemory):
         titans_chunk_size = self.titans_memory.chunk_size
         adaptive_logits = logits[:, titans_chunk_size:, :]
         adaptive_y = y[:, titans_chunk_size:, :]
-        self.k_q_v_memories.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
+        self.q_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
+        self.k_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
+        self.v_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
         self.eta_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
         self.alpha_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
         
@@ -432,7 +502,9 @@ class FullyAdditiveTitansBlock(AssocMemory):
     
     def optimize(self) -> None:
         self.titans_memory.optimize()
-        self.k_q_v_memories.optimize()
+        self.q_memory.optimize()
+        self.k_memory.optimize()
+        self.v_memory.optimize()
         self.eta_memory.optimize()
         self.alpha_memory.optimize()
         
