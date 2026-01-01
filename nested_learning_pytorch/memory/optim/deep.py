@@ -93,12 +93,13 @@ class DeepMomentumGradientDesent(AssocMemory):
         self.register_buffer('eta_ones', torch.ones([1], dtype=torch.float32))
         self.optimizer_key_idx_map = {name: idx for idx, name in enumerate(self.get_optimizer_params().keys())}
         
-        # override optimizers - use object.__setattr__ to bypass PyTorch's module registration
-        object.__setattr__(self, 'inner_optimizer', None)
-        object.__setattr__(self, 'outer_optimizer', None)
-        
         # The inner optimizer gradient vmap, to calculate preconditioner gradient within each task (in batch dimension)
         self.preconditioner_grad_fn = grad(self.cal_preconditioner_loss_vmap)
+        
+        # override optimizers - use object.__setattr__ to bypass PyTorch's module registration
+        object.__setattr__(self, 'inner_optimizer', None)
+        outer_opt = self.outer_optimizer(model = self.model, lr=outer_lr)
+        object.__setattr__(self, 'outer_optimizer', outer_opt)
         
     def retrive_params_by_prefix_lstrip(self, prefix: str, fast_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {name.replace(f'{prefix}.', ''): fast_weights[name] for name in fast_weights.keys() if name.startswith(f'{prefix}.')}

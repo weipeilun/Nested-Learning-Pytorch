@@ -214,47 +214,15 @@ class AssocMemory(nn.Module):
                 
         return updated
     
-    def cal_outer_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor) -> None:
-        if hasattr(self, 'model') and self.model is not None:
-            # todo: test
-            weights = state[self.block_name].weights
-            
-            with torch.enable_grad():
-                losses = self.outer_loss_fn(logits, y)
-                
-                weight_keys = []
-                weight_values = []
-                for weight_name, weight_value in weights.items():
-                    weight_keys.append(weight_name)
-                    weight_values.append(weight_value)
-                
-                grads = torch.autograd.grad(
-                    outputs=losses.mean(),
-                    inputs=weight_values,
-                    retain_graph=True,
-                )
-                # print(f"cal_outer_grads:----------------{self.block_name}----------------")
-                # for weight_key, weight_grad in zip(weight_keys, grads, strict=True):
-                #     print(f"Weight {weight_key} gradient: {weight_grad.norm().item()}")
-                
-                # Apply optimizer to gradients
-                outer_grads = {}
-                for weight_key, grad in zip(weight_keys, grads, strict=True):
-                    outer_grads[weight_key] = grad
-                
-                self.outer_grads = outer_grads
-                    
-        if self.children_blocks is not None:
-            for child_block in self.children_blocks:
-                child_block.cal_outer_grads(logits=logits, state=state, y=y)
-    
-    def optimize(self) -> None:
+    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> None:
         if hasattr(self, 'model') and self.model is not None:
             # Set gradients for model parameters
             for name, param in self.model.named_parameters():
-                if name in self.outer_grads:
-                    # mean over batch when performing outer optimization
-                    param.grad = self.outer_grads[name].mean(dim = 0)
+                grad_key = f'{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{name}'
+                if grad_key in grads_dict:
+                    param.grad = grads_dict[grad_key].mean(dim = 0)
+                else:
+                    raise ValueError(f"Gradient key {grad_key} not found in grads_dict, please check the gradient flow.")
             
             # print(f"------------------{self.block_name}------------------")
             # for name, param in self.model.named_parameters():
@@ -263,17 +231,17 @@ class AssocMemory(nn.Module):
             self.outer_optimizer.zero_grad(set_to_none=True)
             # for name, param in self.model.named_parameters():
             #     print(torch.norm(param).item())
-                
-            # Clear all gradients, retained graphs and GPU memory
-            del self.outer_grads
             
             # Set all parameter gradients to None (more memory efficient than zero_grad)
             for param in self.model.parameters():
                 param.grad = None
+                
+            if '_inner_optimizer' not in self.block_name:
+                self.inner_optimizer.outer_update(grads_dict=grads_dict)
             
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.optimize()
+                child_block.outer_update(grads_dict=grads_dict)
     
     @property
     def memory_model_parameter_dict(self) -> TensorDict | None:
@@ -495,6 +463,9 @@ def _build_block(spec: AssocMemSpec, optimizer_configs: Dict[str, dict], dim: in
     params = params_base.copy()
     params_inner_optimizer = params_base.copy()
     params_outer_optimizer = params_base.copy()
+    
+    outer_optimizer_for_inner_optimizer = build_outer_optimizer(memory_type, optimizer_configs=optimizer_configs, params=params_outer_optimizer)
+    params_inner_optimizer['outer_optimizer'] = outer_optimizer_for_inner_optimizer
     
     params_inner_optimizer['block_name'] = f"{spec.name}{DEFAULT_INNER_OPTIMIZER_SUF}"
     params_outer_optimizer['block_name'] = f"{spec.name}{DEFAULT_OUTER_OPTIMIZER_SUF}"

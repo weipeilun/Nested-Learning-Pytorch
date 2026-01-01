@@ -120,7 +120,7 @@ class HOPEModel(nn.Module):
         # levels (or outer-loop)."
         pbar = tqdm(
             zip(chunk_sizes, step_need_update_dict_list, strict=True),
-            total=sum(chunk_sizes),
+            total=len(chunk_sizes),
             leave=False
         )
         for chunk_size, step_need_update_dict in pbar:
@@ -145,11 +145,8 @@ class HOPEModel(nn.Module):
                 non_grad_weight_keys_list.extend(non_grad_weight_keys)
                 non_grad_weight_values_list.extend(non_grad_weight_values)
             
-            # todo: test
-            # A higher order gradient is not needed in inner loop, so we can use torch.no_grad() cut the gradient computation graph.
-            # vmap is used to compute gradients for each task in batch dimension. It's curical to keep the gradient computation right and efficient.
-            with torch.no_grad():
-                grads, (logits, updated_state) = self.per_task_forward_cal_grads(grad_weight_values_list, non_grad_weight_values_list, seq, target, grad_weight_keys_list, non_grad_weight_keys_list, step_need_update_dict)
+            # A higher order gradient is needed in inner loop. grad() can handle it.
+            grads, (logits, updated_state) = self.per_task_forward_cal_grads(grad_weight_values_list, non_grad_weight_values_list, seq, target, grad_weight_keys_list, non_grad_weight_keys_list, step_need_update_dict)
             
             state = self.update_state(state, updated_state)
             
@@ -173,7 +170,7 @@ class HOPEModel(nn.Module):
         
         return loss, state
     
-    def forward_meta_learning(self, x: torch.Tensor, y: torch.Tensor, state: dict[str, AssocMemState] | None = None) -> torch.Tensor:
+    def forward_inner_loop(self, x: torch.Tensor, y: torch.Tensor, state: dict[str, AssocMemState] | None = None) -> torch.Tensor:
         
         # pack into batch dimension
         
@@ -213,6 +210,7 @@ class HOPEModel(nn.Module):
             non_grad_weight_keys_list.extend(non_grad_weight_keys)
             non_grad_weight_values_list.extend(non_grad_weight_values)
         
+        # vmap is used to compute gradients for each task in batch dimension. It's curical to keep the gradient computation right and efficient.
         outer_grads, state = self.per_task_update_cal_grads(
             grad_weight_values_list,
             non_grad_weight_values_list,
@@ -227,6 +225,10 @@ class HOPEModel(nn.Module):
         outer_grad_dict = {grad_weight_key: outer_grad for grad_weight_key, outer_grad in zip(grad_weight_keys_list, outer_grads, strict=True)}
         
         return outer_grad_dict, state
+    
+    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> None:
+        for block in self.blocks:
+            block.outer_update(grads_dict=grads_dict)
     
     def check_identical_step(self, state: TensorDict[str, TensorDict]) -> bool:
         """Check that all step values in all batch items are identical across all states.

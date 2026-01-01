@@ -15,19 +15,19 @@ def main(cfg: DictConfig) -> None:
     model = build_model_from_cfg(cfg.model).to(device)
     model.is_training = True
     steps = 10
-    x = torch.randn(4, 64, 64)
-    y = torch.randn(4, 64, 64)
+    x = torch.randn(1, 10240, 64)
+    y = torch.randn(1, 10240, 64)
     state = None
     x = x.to(device)
     y = y.to(device)
     for step in range(steps):
         print(f"step {step}")
-        grads_dict, state = model.forward_meta_learning(x=x, y=y, state=state)
+        grads_dict, state = model.forward_inner_loop(x=x, y=y, state=state)
         
-        model.update(grads_dict=grads_dict)
+        model.outer_update(grads_dict=grads_dict)
         
         # Explicitly clean up to prevent memory accumulation
-        logits = None
+        grads_dict = None
         state = None
  
 

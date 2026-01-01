@@ -393,35 +393,18 @@ class FullyAdditiveTitansBlock(AssocMemory):
                 child_block.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
                 
         return updated
-                
-    def cal_outer_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor) -> None:
-        self.titans_memory.cal_outer_grads(logits=logits, state=state, y=y)
-        
-        # adaptive memories' gradients are only available after the first update of the titans memory
-        titans_chunk_size = self.titans_memory.chunk_size
-        adaptive_logits = logits[:, titans_chunk_size:, :]
-        adaptive_y = y[:, titans_chunk_size:, :]
-        self.q_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
-        self.k_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
-        self.v_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
-        self.eta_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
-        self.alpha_memory.cal_outer_grads(logits=adaptive_logits, state=state, y=adaptive_y)
-        
-        if self.children_blocks is not None:
-            for child_block in self.children_blocks:
-                child_block.cal_outer_grads(logits=logits, state=state, y=y)
     
-    def optimize(self) -> None:
-        self.titans_memory.optimize()
-        self.q_memory.optimize()
-        self.k_memory.optimize()
-        self.v_memory.optimize()
-        self.eta_memory.optimize()
-        self.alpha_memory.optimize()
+    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> None:
+        self.titans_memory.outer_update(grads_dict=grads_dict)
+        self.q_memory.outer_update(grads_dict=grads_dict)
+        self.k_memory.outer_update(grads_dict=grads_dict)
+        self.v_memory.outer_update(grads_dict=grads_dict)
+        self.eta_memory.outer_update(grads_dict=grads_dict)
+        self.alpha_memory.outer_update(grads_dict=grads_dict)
         
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.optimize()
+                child_block.outer_update(grads_dict=grads_dict)
     
     def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
         if state is None:
