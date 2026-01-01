@@ -325,7 +325,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             titans_fast_weight_keys.append(titans_fast_weight_name)
             titans_fast_weight_values.append(titans_fast_weight_value)
         
-        # As you can see, this should be the fastest level.
+        # As you can see, this should be the fastest level in main gradient stream.
         titans_grads = self._titans_grad_fn(titans_fast_weight_values, k, v, eta, titans_fast_weight_keys, self.titans_memory.block_name)
         
         # Step 3: update titans memory's gradients using the optimizer.
@@ -339,9 +339,8 @@ class FullyAdditiveTitansBlock(AssocMemory):
         # Step 3.1: apply gradients and one-step update preconditioner.
         # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task.
         # We need t's preconditioner gradients rather than step t - 1's at step t + 1, so we must apply inner_optimizer's gradients before calling inner_optimizer.forward().
-        if self.titans_memory.inner_optimizer.block_name in state and 'updates' in state[self.titans_memory.inner_optimizer.block_name]:
-            updated = self.titans_memory.inner_optimizer.update_preconditioners(grads_dict=titans_grads_dict, state=state)
-            assert updated, "Preconditioner update failed"
+        updated = self.titans_memory.inner_optimizer.update_preconditioners(grads_dict=titans_grads_dict, state=state)
+        assert updated, "Preconditioner update failed"
         
         # Step 3.2: update the momentums (fast weights) using inner optimizer.
         
@@ -382,17 +381,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
             for child_block in self.children_blocks:
                 child_block.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
     
-    def maybe_inner_update_preconditioner(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> None:
-        self.q_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-        self.k_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-        self.v_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-        self.eta_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-        self.alpha_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-        
-        if self.children_blocks is not None:
-            for child_block in self.children_blocks:
-                child_block.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-                
     def maybe_inner_update(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> None:
         self.q_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
         self.k_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
@@ -468,25 +456,37 @@ class FullyAdditiveTitansBlock(AssocMemory):
         weight_values: list[torch.Tensor] = []
         
         # Add all memories' fast weights.
-        self.add_calcuable_weights(state[self.q_memory.block_name][parameter_weight_key], self.q_memory.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.k_memory.block_name][parameter_weight_key], self.k_memory.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.v_memory.block_name][parameter_weight_key], self.v_memory.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.alpha_memory.block_name][parameter_weight_key], self.alpha_memory.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.eta_memory.block_name][parameter_weight_key], self.eta_memory.block_name, weight_keys, weight_values)
+        memory_keys, memory_values = self.q_memory.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+        weight_keys.extend(memory_keys)
+        weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.k_memory.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+        weight_keys.extend(memory_keys)
+        weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.v_memory.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+        weight_keys.extend(memory_keys)
+        weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.alpha_memory.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+        weight_keys.extend(memory_keys)
+        weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.eta_memory.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+        weight_keys.extend(memory_keys)
+        weight_values.extend(memory_values)
+        
         if parameter_weight_key == 'weights':
-            self.add_calcuable_weights(state[self.titans_memory.block_name]['fast_weights'], self.titans_memory.block_name, weight_keys, weight_values)
+            memory_keys, memory_values = self.titans_memory.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+            weight_keys.extend(memory_keys)
+            weight_values.extend(memory_values)
         elif parameter_weight_key == 'fast_weights':
-            pass
+            # All titans memory parameters are updated in a deeper level, so ignore the meta learning's inner gradient flow.
+            memory_keys, memory_values = self.titans_memory.inner_optimizer.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+            weight_keys.extend(memory_keys)
+            weight_values.extend(memory_values)
         else:
             raise ValueError(f"Unsupported parameter weight key: {parameter_weight_key}")
-        
-        # Add all memories' inner optimizer's fast weights, including titans memory's inner optimizer.
-        self.add_calcuable_weights(state[self.q_memory.inner_optimizer.block_name][parameter_weight_key], self.q_memory.inner_optimizer.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.k_memory.inner_optimizer.block_name][parameter_weight_key], self.k_memory.inner_optimizer.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.v_memory.inner_optimizer.block_name][parameter_weight_key], self.v_memory.inner_optimizer.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.alpha_memory.inner_optimizer.block_name][parameter_weight_key], self.alpha_memory.inner_optimizer.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.eta_memory.inner_optimizer.block_name][parameter_weight_key], self.eta_memory.inner_optimizer.block_name, weight_keys, weight_values)
-        self.add_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name][parameter_weight_key], self.titans_memory.inner_optimizer.block_name, weight_keys, weight_values)
         
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
@@ -520,7 +520,11 @@ class FullyAdditiveTitansBlock(AssocMemory):
         fast_weight_keys.extend(memory_keys)
         fast_weight_values.extend(memory_values)
         
-        # Add all titans memory parameters here, since they are updated by a deeper level.
+        memory_keys, memory_values = self.titans_memory.inner_optimizer.get_inner_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        # Add all titans memory parameters here, since they are updated in a deeper level.
         if self.titans_memory.block_name in state:
             self.add_non_calcuable_weights(state[self.titans_memory.block_name]['fast_weights'], self.titans_memory.block_name, 'fast_weights', fast_weight_keys, fast_weight_values)
             self.add_non_calcuable_weights(state[self.titans_memory.block_name]['step'], self.titans_memory.block_name, 'step', fast_weight_keys, fast_weight_values)
@@ -529,14 +533,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
                 self.add_non_calcuable_weights(state[self.titans_memory.block_name]['updates'], self.titans_memory.block_name, 'updates', fast_weight_keys, fast_weight_values)
             if 'n_updates' in state[self.titans_memory.block_name]:
                 self.add_non_calcuable_weights(state[self.titans_memory.block_name]['n_updates'], self.titans_memory.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
-        
-        if self.titans_memory.inner_optimizer.block_name in state:
-            self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['step'], self.titans_memory.inner_optimizer.block_name, 'step', fast_weight_keys, fast_weight_values)
-            self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['last_update_step'], self.titans_memory.inner_optimizer.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
-            if 'updates' in state[self.titans_memory.inner_optimizer.block_name]:
-                self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['updates'], self.titans_memory.inner_optimizer.block_name, 'updates', fast_weight_keys, fast_weight_values)
-            if 'n_updates' in state[self.titans_memory.inner_optimizer.block_name]:
-                self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['n_updates'], self.titans_memory.inner_optimizer.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
 
         if self.children_blocks is not None:
             for child_block in self.children_blocks:

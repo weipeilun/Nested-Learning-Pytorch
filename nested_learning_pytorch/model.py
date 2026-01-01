@@ -84,7 +84,7 @@ class HOPEModel(nn.Module):
         forward_chunk_state = rebuild_state(grad_weight_values_list, non_grad_weight_values_list, grad_weight_keys_list, non_grad_weight_keys_list, weights_keys=['fast_weights'])
             
         # Update fast_weights if needed.
-        # We put step t - 1's updates to step t's start, just for the vmap can grasp all the gradients it needs.
+        # Since we are in a vmap, in order to make the grad() grasp all the gradients it needed, step t - 1's update must be put to step t's start.
         for block in self.blocks:
             block.maybe_inner_update(state=forward_chunk_state, step_need_update_dict=step_need_update_dict)
         
@@ -118,11 +118,18 @@ class HOPEModel(nn.Module):
         # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
         # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
         # levels (or outer-loop)."
-        for chunk_size, step_need_update_dict in zip(chunk_sizes, step_need_update_dict_list, strict=True):
+        pbar = tqdm(
+            zip(chunk_sizes, step_need_update_dict_list, strict=True),
+            total=sum(chunk_sizes),
+            leave=False
+        )
+        for chunk_size, step_need_update_dict in pbar:
             seq_start_step = current_step
             seq_end_step = seq_start_step + chunk_size
             seq = x[seq_start_step:seq_end_step, :]
             target = y[seq_start_step:seq_end_step, :]
+            
+            pbar.set_description(f"seq_len {seq_start_step}")
             
             grad_weight_keys_list: list[str] = []
             grad_weight_values_list: list[torch.Tensor] = []
@@ -157,10 +164,6 @@ class HOPEModel(nn.Module):
             # Cache the inner gradients in case blocks' inner update frequency is different
             for block in self.blocks:
                 block.cache_inner_grads(state=state, block_grads_dict=block_grad_dict)
-            
-            # One step update the inner optimizer's preconditioner here, since we can't calculate gradients inside vmap.
-            for block in self.blocks:
-                block.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
                 
             # Accumulate results
             logits_list.append(logits)
@@ -221,7 +224,7 @@ class HOPEModel(nn.Module):
             step_need_update_dict_list
         )
         
-        outer_grad_dict = {non_grad_weight_key: outer_grad for non_grad_weight_key, outer_grad in zip(non_grad_weight_keys_list, outer_grads, strict=True)}
+        outer_grad_dict = {grad_weight_key: outer_grad for grad_weight_key, outer_grad in zip(grad_weight_keys_list, outer_grads, strict=True)}
         
         return outer_grad_dict, state
     
@@ -307,9 +310,11 @@ class HOPEModel(nn.Module):
         return new_state
 
     def if_step_need_update(self, state: dict[str, AssocMemState], chunk_sizes: list[int]) -> dict[str, bool]:
-        step_need_update_dict_list = []
+        # The update of step t is placed in step t + 1's start, so we need to generate the step_need_update_dict for step t - 1 in advance.
+        step_need_update_dict_list = [{}]
         start_step = 0
-        for chunk_size in chunk_sizes:
+        for i in range(len(chunk_sizes) - 1):
+            chunk_size = chunk_sizes[i]
             end_step = start_step + chunk_size
             step_need_update_dict = {}
             for block_name in state.keys():

@@ -191,7 +191,8 @@ class MemoryMLP(Module):
         n_heads = 1,
         expansion_factor = 2.,
         out_dim = None,
-        with_bias = False
+        with_bias = False,
+        activation_fn = nn.GELU()
     ):
         super().__init__()
         dim_hidden = int(dim * expansion_factor)
@@ -230,6 +231,7 @@ class MemoryMLP(Module):
                 nn.init.xavier_uniform_(weight)
         
         self.with_bias = with_bias
+        self.activation_fn = activation_fn
 
     def forward(
         self,
@@ -247,7 +249,7 @@ class MemoryMLP(Module):
             is_first = ind == 0
 
             if not is_first:
-                x = F.gelu(x)
+                x = self.activation_fn(x)
 
             if p is None:
                 x = x @ weight

@@ -39,7 +39,6 @@ class DeepMomentumGradientDesent(AssocMemory):
         outer_loss_fn: nn.Module,
         alpha: float = 0.9,
         eta: float = 0.1,
-        normalization: str = 'residual_pre_norm',
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -76,13 +75,10 @@ class DeepMomentumGradientDesent(AssocMemory):
             if param.ndim > 1:
                 # Equation 51, we can use a higher-order feature map to enhance the capacity of a memory.
                 # This can be configured via hope_xxx.yaml file.
-                preconditioner = MemoryMLP(dim=param.shape[-1], is_multi_head=is_multi_head, n_heads=n_heads, **default_model_kwargs)
+                # It's a gradient, all imformation of grads are important - scale, angle, curvature, correlation, energy etc. 
+                # Any normalization / residual / non-linearity will distroy its geometry.
+                preconditioner = MemoryMLP(dim=param.shape[-1], is_multi_head=is_multi_head, n_heads=n_heads, activation_fn=nn.Identity(), **default_model_kwargs)
                 
-                # the memory is the weights of the model
-
-                if normalization:
-                    preconditioner = NormalizationBuilder(normalization)(dim = param.shape[-1], is_multi_head = is_multi_head, model = preconditioner, **default_model_kwargs)
-
                 params_dict[f'{safe_name}_preconditioner'] = preconditioner
 
             self.param_name_mapping[name] = safe_name
@@ -129,31 +125,37 @@ class DeepMomentumGradientDesent(AssocMemory):
 
         # Eliminate off-diagonal elements. This is the orthogonal space.
         # equation 43 (Delta rule) 
-        # preconditioner_loss = ((G - torch.diag_embed(G.diagonal(dim1=-2, dim2=-1))) ** 2).mean()
-        preconditioner_loss = ((G - torch.eye(G.shape[-1], device=G.device)) ** 2).mean()
+        # Unrestricting the length of vectors of size O_i means that: 
+        # 1. each vector can have a different scale, which is a good thing in a learned optimizer; 
+        # 2. gradient is insensitive to scale, which is more conducive to maintaining numerical stability.
+        # preconditioner_loss = ((G - torch.eye(G.shape[-1], device=G.device)) ** 2).mean()
+        preconditioner_loss = ((G - torch.diag_embed(G.diagonal(dim1=-2, dim2=-1))) ** 2).mean()
         
         return preconditioner_loss
     
     def update_preconditioners(self, grads_dict: TensorDict, state: dict[str, AssocMemState]) -> TensorDict:
         if hasattr(self, 'model') and self.model is not None:
             fast_weights = state[self.block_name]['fast_weights']
-            updates = state[self.block_name]['updates']
-            n_updates = state[self.block_name]['n_updates']
-            
-            # Updates are added through multiple chunks, we need to divide by the number of chunks to get the average gradient.
-            averaged_updates = self.average_updates(updates=updates, n_updates=n_updates)
             
             # Step 1: apply gradients to the preconditioner.
-            # Equation 41 in NL paper.
-            applied_grads_fast_weights = {}
-            for fast_weight_key, fast_weight_value in fast_weights.items():
-                if '_preconditioner' in fast_weight_key:
-                    if fast_weight_key in averaged_updates:
-                        applied_grads_fast_weights[fast_weight_key] = fast_weight_value + averaged_updates[fast_weight_key] * (-self.inner_lr)
-                    else:
-                        applied_grads_fast_weights[fast_weight_key] = fast_weight_value
-                else:
-                    applied_grads_fast_weights[fast_weight_key] = fast_weight_value
+            if 'updates' in state[self.block_name] and 'n_updates' in state[self.block_name]:
+                updates = state[self.block_name]['updates']
+                n_updates = state[self.block_name]['n_updates']
+                
+                # Updates are added through multiple chunks, we need to divide by the number of chunks to get the average gradient.
+                averaged_updates = self.average_updates(updates=updates, n_updates=n_updates)
+                
+                # Equation 41 in NL paper.
+                applied_grads_fast_weights = {}
+                for fast_weight_key, fast_weight_value in fast_weights.items():
+                    if '_preconditioner' in fast_weight_key:
+                        if fast_weight_key in averaged_updates:
+                            applied_grads_fast_weights[fast_weight_key] = fast_weight_value + averaged_updates[fast_weight_key] * (-self.inner_lr)
+                        else:
+                            applied_grads_fast_weights[fast_weight_key] = fast_weight_value
+            else:
+                # This should only happen in the first step of each inner loop.
+                applied_grads_fast_weights = fast_weights
             
             # Step 2: optimize the preconditioner to orthogonal space.
             new_fast_weights = {}
@@ -186,7 +188,6 @@ class DeepMomentumGradientDesent(AssocMemory):
                 # We update the preconditioner with one-step inner loop first, and then use the updated preconditioner to update the momentum.
                 # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task, which is a geometric correction of the orthogonal vector space, rather than a numerical optimization in SGD.
                 # torch.no_grad() to cut the computation graph of the preconditioner, because we don't want higher order derivatives.
-                # todo: need to avoid higher order derivatives?
                 with torch.no_grad():
                     preconditioner_grads = self.preconditioner_grad_fn(preconditioner_fast_weight_values, g_eff, preconditioner_fast_weight_keys, preconditioner_safe_name)
                 
@@ -195,7 +196,7 @@ class DeepMomentumGradientDesent(AssocMemory):
                 for preconditioner_fast_weight_key, preconditioner_grad, preconditioner_fast_weight_value in zip(preconditioner_fast_weight_keys, preconditioner_grads, preconditioner_fast_weight_values, strict=True):
                     new_fast_weights[f'{preconditioner_safe_name}.{preconditioner_fast_weight_key}'] = preconditioner_fast_weight_value + preconditioner_grad * (-self.inner_lr)
             
-            for fast_weight_key, fast_weight_value in applied_grads_fast_weights.items():
+            for fast_weight_key, fast_weight_value in fast_weights.items():
                 if fast_weight_key not in new_fast_weights:
                     new_fast_weights[fast_weight_key] = fast_weight_value
             
@@ -208,6 +209,10 @@ class DeepMomentumGradientDesent(AssocMemory):
             #         assert (new_fast_weights[fast_weight_key] != fast_weights[fast_weight_key]).any(), f"Preconditioner {fast_weight_key} should be updated"
             
             state[self.block_name]['fast_weights'] = new_fast_weights
+            if 'updates' in state[self.block_name]:
+                state[self.block_name]['updates'] = {update_key: torch.zeros_like(update_value) for update_key, update_value in state[self.block_name]['updates'].items()}
+            if 'n_updates' in state[self.block_name]:
+                state[self.block_name]['n_updates'] = torch.zeros_like(state[self.block_name]['n_updates'])
 
             return True
         return False
@@ -219,12 +224,12 @@ class DeepMomentumGradientDesent(AssocMemory):
             alpha = self.alpha
             eta = self.eta
         else:
-            # If we received a not None alpha, we assume the learning rate (eta) is dealt outside when calculating loss.
+            # We assume the learning rate (eta) is dealt outside when calculating loss.
             alpha = alpha
             eta = self.eta_ones
             
         # Optimize the momentum and the fast weights for each optimizer parameter.
-        new_momentum_fast_weights_dict = dict()
+        new_momentum_dict = dict()
         for grad_name, grad_value in x.items():
             need_pack = False
             
@@ -241,14 +246,13 @@ class DeepMomentumGradientDesent(AssocMemory):
             else:
                 raise ValueError("Unsupported g shape")
             
+            # Step 1: map the gradient to orthogonalized space.
             if grad_value.dim() > 1:
-                # Step 1: get the updated preconditioner fast weight.
                 preconditioner_safe_name = f'{self.param_name_mapping[grad_name]}_preconditioner'
                 preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, fast_weights) # (d2, d2)                if need_pack:
                 if need_pack:
                     preconditioner_fast_weight_dict = repeat_dict_values(preconditioner_fast_weight_dict, 'b h i j -> (b h) i j')
                 
-                # Step 2: the gradient in orthogonalized space.
                 grad_in_orthogonalized_space = functional_call(self.model[preconditioner_safe_name], preconditioner_fast_weight_dict, (g_eff,), {'pattern': self.default_pattern})
             elif grad_value.dim() == 1:
                 # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
@@ -256,20 +260,13 @@ class DeepMomentumGradientDesent(AssocMemory):
             else:
                 raise ValueError("Unsupported g shape")
             
-            # Step 3: update the momentum (fast weights) of the optimizer.
+            # Step 2: update the momentum (fast weights) of the optimizer.
             # Equation 47 (Hebbian-rule) / 49 (delta rule), depending on self.inner_loss_fn, calculated at the end of vmap.
             momentum_fast_weights_dict = self.retrive_params_by_prefix_lstrip(self.param_name_mapping[grad_name], fast_weights)
             if need_pack:
                 momentum_fast_weights_dict = repeat_dict_values(momentum_fast_weights_dict, 'b h i j -> (b h) i j')
-            try:
-                assert len(momentum_fast_weights_dict) == 1, f"Momentum should have only one fast weight: {self.block_name}"
-            except Exception as e:
-                print(f"Error in forward: {e}")
-                print(f"momentum_fast_weights_dict: {momentum_fast_weights_dict}")
-                print(f"fast_weights: {fast_weights}")
-                print(f"grad_name: {grad_name}")
-                print(f"grad_value: {grad_value}")
-                raise e
+
+            assert len(momentum_fast_weights_dict) == 1, f"Momentum should have only one fast weight: {self.block_name}"
             
             for momentum_fast_weights_key, momentum_fast_weights_value in momentum_fast_weights_dict.items():
                 alpha_unsqueezed = alpha
@@ -279,14 +276,15 @@ class DeepMomentumGradientDesent(AssocMemory):
                 while eta_unsqueezed.ndim != momentum_fast_weights_value.ndim:
                     eta_unsqueezed = eta_unsqueezed.unsqueeze(-1)
                     
-                new_momentum_fast_weights_dict[f'{self.param_name_mapping[grad_name]}.{momentum_fast_weights_key}'] = momentum_fast_weights_value * alpha_unsqueezed - grad_in_orthogonalized_space * eta_unsqueezed
+                new_momentum_dict[f'{self.param_name_mapping[grad_name]}.{momentum_fast_weights_key}'] = momentum_fast_weights_value * alpha_unsqueezed - grad_in_orthogonalized_space * eta_unsqueezed
             
+        new_momentum_fast_weights_dict = new_momentum_dict.copy()
         for fast_weight_key, fast_weight_value in fast_weights.items():
             if fast_weight_key not in new_momentum_fast_weights_dict:
                 new_momentum_fast_weights_dict[fast_weight_key] = fast_weight_value
                 
         state[self.block_name]['fast_weights'] = new_momentum_fast_weights_dict
-        return new_momentum_fast_weights_dict, state
+        return new_momentum_dict, state
     
     def get_calcuable_weights(self, state: dict[str, AssocMemState], parameter_weight_key: str) -> dict[str, torch.Tensor]:
         weight_keys: list[str] = []
@@ -296,10 +294,10 @@ class DeepMomentumGradientDesent(AssocMemory):
             weights = state[self.block_name][parameter_weight_key]
             for key, value in weights.items():
                 # preconditioner update is not in vmap, it's need to be added to non_calcuable_fast_weights
-                if '_preconditioner' in key:
+                if parameter_weight_key == 'weights':
                     weight_keys.append(f"{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
                     weight_values.append(value)
-                elif parameter_weight_key == 'weights':
+                elif '_preconditioner' in key:
                     weight_keys.append(f"{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
                     weight_values.append(value)
             

@@ -146,21 +146,12 @@ class AssocMemory(nn.Module):
             grads_dict = block_grads_dict[self.block_name]
                 
             new_updates = {}
-            try:
-                for fast_weight_key, fast_weight_grad in grads_dict.items(): 
-                    # add to historic gradients
-                    if updates is not None:
-                        new_updates[fast_weight_key] = updates[fast_weight_key] + fast_weight_grad
-                    else:
-                        new_updates[fast_weight_key] = fast_weight_grad
-            except Exception as e:
-                print(f"Error in cache_inner_grads: {e}")
-                print(f"grads_dict: {grads_dict}")
-                print(f"updates: {updates}")
-                print(f"n_updates: {n_updates}")
-                print(f"block_grads_dict: {block_grads_dict}")
-                print(f"state: {state}")
-                raise e
+            for fast_weight_key, fast_weight_grad in grads_dict.items(): 
+                # add to historic gradients
+                if updates is not None:
+                    new_updates[fast_weight_key] = updates[fast_weight_key] + fast_weight_grad
+                else:
+                    new_updates[fast_weight_key] = fast_weight_grad
         
             if new_updates:
                 state[self.block_name]['updates'] = new_updates
@@ -173,27 +164,6 @@ class AssocMemory(nn.Module):
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
                 child_block.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
-                
-    def maybe_inner_update_preconditioner(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> bool:
-        updated = False
-        if self.block_name in step_need_update_dict and step_need_update_dict[self.block_name]:
-            updates = state[self.block_name]['updates']
-            
-            # Here we introduce DGD with weight decay, which projects the momentums to the orthogonal space, hoping to keep the optimizer memorizing through a long context
-            # Update the optimizer first then use it to optimize the Titans memory.
-            # It's important to update the optimizer first, otherwise will lead to a suboptimal result - both instinctly and according to equation 50 in NL paper.
-            
-            # Step 1: apply gradients and one-step update preconditioner.
-            # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task.
-            # We need t's preconditioner gradients rather than step t - 1's at step t + 1, so we must apply inner_optimizer's gradients before calling inner_optimizer.forward().
-            updated = self.inner_optimizer.update_preconditioners(grads_dict=updates, state=state)
-            assert updated, "Preconditioner update failed"
-            
-        if self.children_blocks is not None:
-            for child_block in self.children_blocks:
-                child_block.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
-                
-        return updated
 
     def maybe_inner_update(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> bool:
         updated = False
@@ -209,18 +179,24 @@ class AssocMemory(nn.Module):
             # Update the optimizer first then use it to optimize the Titans memory.
             # It's important to update the optimizer first, otherwise will lead to a suboptimal result - both instinctly and according to equation 50 in NL paper.
             
-            # Step 2: update the momentums (fast weights) using inner optimizer.
-            updates_optimized, state = self.inner_optimizer(x=averaged_updates, state=state)
+            # Step 1: apply gradients to preconditioner and one-step update preconditioner.
+            # The goal of one-step update is to eliminate the most obvious non-orthogonal components in the current batch/task.
+            # We need t's preconditioner gradients rather than t - 1's at step t + 1. So inner_optimizer's gradients must be applied before calling inner_optimizer.forward().
+            updated = self.inner_optimizer.update_preconditioners(grads_dict=averaged_updates, state=state)
+            assert updated, "Preconditioner update failed"
             
-            # Step 3: update the fast weights.
+            # Step 2: get the momentums using inner optimizer.
+            momentums, state = self.inner_optimizer(x=averaged_updates, state=state)
+            
+            # Step 3: update the fast weights using momentums.
             # Equation 50 in NL paper.
             new_fast_weights = {}
             for fast_weight_key, fast_weight_value in fast_weights.items():
                 momentum_key = f"{self.inner_optimizer.param_name_mapping[fast_weight_key]}.momentum"
                 
-                assert momentum_key in updates_optimized, f"Momentum key {momentum_key} not found in updates_optimized"
+                assert momentum_key in momentums, f"Momentum key {momentum_key} not found in momentum_deltas"
                 
-                new_fast_weights[fast_weight_key] = fast_weight_value + updates_optimized[momentum_key]
+                new_fast_weights[fast_weight_key] = fast_weight_value + momentums[momentum_key]
             
             # Update fast_weights with the new values.
             state[self.block_name]['fast_weights'] = new_fast_weights
@@ -316,13 +292,7 @@ class AssocMemory(nn.Module):
             return None
     
     def average_updates(self, updates: TensorDict, n_updates: torch.Tensor) -> TensorDict:
-        new_updates = {}
-        for update_key, update_value in updates.items():
-            n_updates_unsqueezed = n_updates
-            while n_updates_unsqueezed.ndim != update_value.ndim:
-                n_updates_unsqueezed = n_updates_unsqueezed.unsqueeze(-1)
-            new_updates[update_key] = update_value / n_updates_unsqueezed
-        return new_updates
+        return {update_key: update_value / n_updates for update_key, update_value in updates.items()}
     
     def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
         if state is None:
@@ -393,7 +363,13 @@ class AssocMemory(nn.Module):
         weight_values: list[torch.Tensor] = []
         
         if self.block_name in state:
-            self.add_calcuable_weights(state[self.block_name][parameter_weight_key], self.block_name, weight_keys, weight_values)
+            try:
+                self.add_calcuable_weights(state[self.block_name][parameter_weight_key], self.block_name, weight_keys, weight_values)
+            except Exception as e:
+                print(f"Error in get_calcuable_weights: {e}")
+                print(f"state: {state}")
+                print(f"parameter_weight_key: {parameter_weight_key}")
+                raise e
         
             optimizer_keys, optimizer_values = self.inner_optimizer.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
             weight_keys.extend(optimizer_keys)
