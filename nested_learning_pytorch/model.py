@@ -227,8 +227,12 @@ class HOPEModel(nn.Module):
         return outer_grad_dict, state
     
     def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> None:
+        n_updated = 0
         for block in self.blocks:
-            block.outer_update(grads_dict=grads_dict)
+            n_updated += block.outer_update(grads_dict=grads_dict)
+            
+        if n_updated != len(grads_dict):
+            raise ValueError(f"Number of updated blocks {n_updated} does not match the number of grads_dict {len(grads_dict)}, please check the gradient flow.")
     
     def check_identical_step(self, state: TensorDict[str, TensorDict]) -> bool:
         """Check that all step values in all batch items are identical across all states.

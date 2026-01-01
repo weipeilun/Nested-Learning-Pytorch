@@ -394,17 +394,20 @@ class FullyAdditiveTitansBlock(AssocMemory):
                 
         return updated
     
-    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> None:
-        self.titans_memory.outer_update(grads_dict=grads_dict)
-        self.q_memory.outer_update(grads_dict=grads_dict)
-        self.k_memory.outer_update(grads_dict=grads_dict)
-        self.v_memory.outer_update(grads_dict=grads_dict)
-        self.eta_memory.outer_update(grads_dict=grads_dict)
-        self.alpha_memory.outer_update(grads_dict=grads_dict)
+    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> int:
+        n_updated = 0
+        n_updated += self.titans_memory.outer_update(grads_dict=grads_dict)
+        n_updated += self.q_memory.outer_update(grads_dict=grads_dict)
+        n_updated += self.k_memory.outer_update(grads_dict=grads_dict)
+        n_updated += self.v_memory.outer_update(grads_dict=grads_dict)
+        n_updated += self.eta_memory.outer_update(grads_dict=grads_dict)
+        n_updated += self.alpha_memory.outer_update(grads_dict=grads_dict)
         
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.outer_update(grads_dict=grads_dict)
+                n_updated += child_block.outer_update(grads_dict=grads_dict)
+        
+        return n_updated
     
     def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
         if state is None:

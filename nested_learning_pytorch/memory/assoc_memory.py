@@ -214,13 +214,15 @@ class AssocMemory(nn.Module):
                 
         return updated
     
-    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> None:
+    def outer_update(self, grads_dict: dict[str, torch.Tensor]) -> int:
+        n_updated = 0
         if hasattr(self, 'model') and self.model is not None:
             # Set gradients for model parameters
             for name, param in self.model.named_parameters():
                 grad_key = f'{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{name}'
                 if grad_key in grads_dict:
                     param.grad = grads_dict[grad_key].mean(dim = 0)
+                    n_updated += 1
                 else:
                     raise ValueError(f"Gradient key {grad_key} not found in grads_dict, please check the gradient flow.")
             
@@ -237,11 +239,13 @@ class AssocMemory(nn.Module):
                 param.grad = None
                 
             if '_inner_optimizer' not in self.block_name:
-                self.inner_optimizer.outer_update(grads_dict=grads_dict)
+                n_updated += self.inner_optimizer.outer_update(grads_dict=grads_dict)
             
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.outer_update(grads_dict=grads_dict)
+                n_updated += child_block.outer_update(grads_dict=grads_dict)
+        
+        return n_updated
     
     @property
     def memory_model_parameter_dict(self) -> TensorDict | None:
