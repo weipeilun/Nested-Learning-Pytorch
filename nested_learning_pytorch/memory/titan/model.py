@@ -4,16 +4,16 @@ from typing import Callable
 import warnings
 from dataclasses import dataclass
 from functools import partial
+from torch.func import vmap, grad
 
 from tensordict import TensorDict
 import torch
 from torch import nn
-from torch.nn import Linear, Module, Parameter
-from torch.func import functional_call
 
 from ..assoc_memory import AssocMemory, AssocMemState
 
 from ..ffn.model import FFNBlock
+from ...manager import rebuild_state_for_titans
 
 from ...utils import pack_one_with_inverse, default, safe_cat, exists, repeat_dict_values
 
@@ -41,18 +41,18 @@ class FullyAdditiveTitansBlock(AssocMemory):
     # Register this class with type name "Memory"
     _type_name = "FullyAdaptiveTitans"
     
-    @dataclass
-    class TitansState(AssocMemState):
-        k: torch.Tensor | None = None
-        v: torch.Tensor | None = None
-        eta: torch.Tensor | None = None
-        alpha: torch.Tensor | None = None
-        last_alpha_fast_weight: torch.Tensor | None = None
-        last_eta_fast_weight: torch.Tensor | None = None
-        last_q_fast_weight: torch.Tensor | None = None
-        last_k_fast_weight: torch.Tensor | None = None
-        last_v_fast_weight: torch.Tensor | None = None
-        last_step_updated: bool = False
+    # @dataclass
+    # class TitansState(AssocMemState):
+    #     k: torch.Tensor | None = None
+    #     v: torch.Tensor | None = None
+    #     eta: torch.Tensor | None = None
+    #     alpha: torch.Tensor | None = None
+    #     last_alpha_fast_weight: torch.Tensor | None = None
+    #     last_eta_fast_weight: torch.Tensor | None = None
+    #     last_q_fast_weight: torch.Tensor | None = None
+    #     last_k_fast_weight: torch.Tensor | None = None
+    #     last_v_fast_weight: torch.Tensor | None = None
+    #     last_step_updated: bool = False
         
     def __init__(
         self,
@@ -111,7 +111,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             normalization=None,
-            memory_state_clz=self.TitansState,
             default_model_kwargs=default_model_kwargs,
         )
         
@@ -230,6 +229,15 @@ class FullyAdditiveTitansBlock(AssocMemory):
         self.model = None # will disable the normal update stages
         object.__setattr__(self, 'inner_optimizer', None)
         object.__setattr__(self, 'outer_optimizer', None)
+        
+        def titans_memory_loss_fn(titans_fast_weight_values, k, v, eta, titans_fast_weight_keys, titans_memory_block_name):
+            titans_memory_state = rebuild_state_for_titans(titans_fast_weight_values, titans_fast_weight_keys, titans_memory_block_name)
+            titans_logits, titans_memory_state = self.titans_memory(x=k, state=titans_memory_state, auto_update_step=False, pattern='s d, d o -> s o')
+            weighted_titans_logits = titans_logits * eta.unsqueeze(-1)
+            return self.inner_loss_fn(weighted_titans_logits, v)
+        
+        self._titans_grad_fn = grad(titans_memory_loss_fn)
+        
     
     def _initialize_eta_alpha_weights(self):
         """
@@ -297,9 +305,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             
         x_normed = self.retrieve_norm(x)
         
-        # pack into batch dimension
-        
-        x_normed, inverse_pack = pack_one_with_inverse(x_normed, '* l d')
+        # Step 1: calculate all titans memories parameters.
             
         q, state = self.q_memory(x=x_normed, state=state)
         k, state = self.k_memory(x=x_normed, state=state)
@@ -309,179 +315,96 @@ class FullyAdditiveTitansBlock(AssocMemory):
         eta = eta_logits.sigmoid().squeeze(dim=-1)
         
         alpha_logits, state = self.alpha_memory(x=x_normed, state=state)
-        alpha = alpha_logits.sigmoid().squeeze(dim=-1)
+        alpha = alpha_logits.sigmoid().squeeze(dim=-1).mean()
         
-        titans_logits, state = self.titans_memory(x=q, state=state)
+        # Step 2: calculate titans memory's loss and gradients.
         
-        # record k, v, eta, alpha for update
-        titans_state = state[self.titans_memory.block_name]
-        titans_state.k = safe_cat([titans_state.k, k], dim=1)
-        titans_state.v = safe_cat([titans_state.v, v], dim=1)
-        titans_state.eta = safe_cat([titans_state.eta, eta], dim=1)
-        titans_state.alpha = safe_cat([titans_state.alpha, alpha], dim=1)
+        titans_fast_weight_keys = []
+        titans_fast_weight_values = []
+        for titans_fast_weight_name, titans_fast_weight_value in state[self.titans_memory.block_name]['fast_weights'].items():
+            titans_fast_weight_keys.append(titans_fast_weight_name)
+            titans_fast_weight_values.append(titans_fast_weight_value)
         
-        titans_logits = inverse_pack(titans_logits, '* l d')
+        # As you can see, this should be the fastest level.
+        titans_grads = self._titans_grad_fn(titans_fast_weight_values, k, v, eta, titans_fast_weight_keys, self.titans_memory.block_name)
+        
+        # Step 3: update titans memory's gradients using the optimizer.
+        
+        titans_grads_dict = {key: grad for key, grad in zip(titans_fast_weight_keys, titans_grads, strict=True)}
+        
+        # Here we introduce DGD with weight decay, which projects the momentums to the orthogonal space, hoping to keep the optimizer memorizing through a long context
+        # Update the optimizer first then use it to optimize the Titans memory.
+        # It's important to update the optimizer first, otherwise will lead to a suboptimal result - both instinctly and according to equation 50 in NL paper.
+        
+        # Step 3.1: apply gradients and one-step update preconditioner.
+        # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task.
+        # We need t's preconditioner gradients rather than step t - 1's at step t + 1, so we must apply inner_optimizer's gradients before calling inner_optimizer.forward().
+        if self.titans_memory.inner_optimizer.block_name in state and 'updates' in state[self.titans_memory.inner_optimizer.block_name]:
+            updated = self.titans_memory.inner_optimizer.update_preconditioners(grads_dict=titans_grads_dict, state=state)
+            assert updated, "Preconditioner update failed"
+        
+        # Step 3.2: update the momentums (fast weights) using inner optimizer.
+        
+        titans_grads_dict_optimized, state = self.titans_memory.inner_optimizer(x=titans_grads_dict, state=state, alpha=alpha)
+        
+        # Fix step update failure because titans memory is not called yet.
+        
+        state[self.titans_memory.inner_optimizer.block_name]['step'] = state[self.titans_memory.inner_optimizer.block_name]['step'] + x.shape[0]
+        
+        # Step 4: update titans memory's fast weights using the optimized gradients.
+        # Equation 50 in NL paper.
+        new_fast_weights = {}
+        for fast_weight_key, fast_weight_value in state[self.titans_memory.block_name]['fast_weights'].items():
+            momentum_key = f"{self.titans_memory.inner_optimizer.param_name_mapping[fast_weight_key]}.momentum"
+            
+            assert momentum_key in titans_grads_dict_optimized, f"Momentum key {momentum_key} not found in titans_grads_dict_optimized"
+            
+            new_fast_weights[fast_weight_key] = fast_weight_value + titans_grads_dict_optimized[momentum_key]
+            
+        state[self.titans_memory.block_name]['fast_weights'] = new_fast_weights
+        
+        # Step 5: query titans memory.
+        
+        titans_logits, state = self.titans_memory(x=q, state=state, pattern='s d, d o -> s o')
 
         return titans_logits + x, state
-    
-    def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
-        if state is None:
-            state = {}
-        
-        batch_size = default(batch_size, 1)
-        
-        if self.q_memory.block_name not in state:
-            self.q_memory.init_state(state=state, batch_size=batch_size)
-            
-        if self.k_memory.block_name not in state:
-            self.k_memory.init_state(state=state, batch_size=batch_size)
-            
-        if self.v_memory.block_name not in state:
-            self.v_memory.init_state(state=state, batch_size=batch_size)
-            
-        if self.eta_memory.block_name not in state:
-            self.eta_memory.init_state(state=state, batch_size=batch_size)
-            
-        if self.alpha_memory.block_name not in state:
-            self.alpha_memory.init_state(state=state, batch_size=batch_size)
-            
-        if self.titans_memory.block_name not in state:
-            self.titans_memory.init_state(state=state, batch_size=batch_size)
+          
+    def cache_inner_grads(self, state: dict[str, AssocMemState], block_grads_dict: dict[str, torch.Tensor]) -> None:
+        self.q_memory.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
+        self.k_memory.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
+        self.v_memory.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
+        self.eta_memory.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
+        self.alpha_memory.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
+        # Titans memory fast weights' gradients are not calculated in main gradients stream.
+        self.titans_memory.inner_optimizer.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
         
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.init_state(state=state, batch_size=batch_size)
-
-        return state
+                child_block.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
     
-    def get_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
-        fast_weight_keys: list[str] = []
-        fast_weight_values: list[torch.Tensor] = []
-        
-        # t - 1's titans calcuable fast weights is not added to graph util t, so we need to get the t - 1's fast weights, that is the fast weights in caches
-        titans_state = state[self.titans_memory.block_name]
-        
-        self.add_calcuable_fast_weights(titans_state.last_q_fast_weight, self.q_memory.block_name, fast_weight_keys, fast_weight_values)
-        self.add_calcuable_fast_weights(titans_state.last_k_fast_weight, self.k_memory.block_name, fast_weight_keys, fast_weight_values)
-        self.add_calcuable_fast_weights(titans_state.last_v_fast_weight, self.v_memory.block_name, fast_weight_keys, fast_weight_values)
-        self.add_calcuable_fast_weights(titans_state.last_alpha_fast_weight, self.alpha_memory.block_name, fast_weight_keys, fast_weight_values)
-        self.add_calcuable_fast_weights(titans_state.last_eta_fast_weight, self.eta_memory.block_name, fast_weight_keys, fast_weight_values)
+    def maybe_inner_update_preconditioner(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> None:
+        self.q_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
+        self.k_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
+        self.v_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
+        self.eta_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
+        self.alpha_memory.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
         
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block_keys, child_block_values = child_block.get_calcuable_fast_weights(state=state)
-                fast_weight_keys.extend(child_block_keys)
-                fast_weight_values.extend(child_block_values)
-        
-        return fast_weight_keys, fast_weight_values
-    
-    # Note: Titans memory must be the fastest weight; gradients can only be passed to adaptive memories after Titans memory is updated.
-    # So we update fast weights directly in this function, no need to cache the gradients into `updates`.
-    def cal_inner_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor, block_grads_dict: dict[str, torch.Tensor], losses: torch.Tensor | None = None) -> None:
-        titans_state = state[self.titans_memory.block_name]
-        k = titans_state.k
-        v = titans_state.v
-        eta = titans_state.eta      # learning rate
-        alpha = titans_state.alpha.mean(dim=-1)  # retention gate (mean over sequence)
-        titans_fast_weights = titans_state.fast_weights
-        
-        with torch.enable_grad():
-            titans_logits, state = self.titans_memory(x=k, state=state, auto_update_step=False)
-            titans_losses = self.inner_loss_fn(titans_logits, v).mean(dim=2)
-            
-            # The subscript of eta is t. It's the learning rate of each token.
-            titans_weighted_losses = titans_losses * eta
-            
-            titans_fast_weight_keys = []
-            titans_fast_weight_values = []
-            for titans_fast_weight_name, titans_fast_weight_value in titans_fast_weights.items():
-                titans_fast_weight_keys.append(titans_fast_weight_name)
-                titans_fast_weight_values.append(titans_fast_weight_value)
-            
-            # Compute gradients with respect to fast_weights
-            # We need to compute the second order gradients in higher levels, so we need to set retain_graph and create_graph to True
-            # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
-            # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
-            # levels (or outer-loop)."
-            # We sum the batch dimension of the loss to avoid the division by the number of tasks, which is not expected in meta learning.
-            titans_grads = torch.autograd.grad(
-                outputs=titans_weighted_losses.mean(dim=1).sum(dim=0),
-                inputs=titans_fast_weight_values,
-                retain_graph=True,
-                create_graph=True,
-            )
-            
-            # print(f"----------------{self.titans_memory.block_name}----------------")
-            # for weight_key, weight_grad in zip(titans_fast_weight_keys.keys(), titans_grads, strict=True):
-            #     print(f"Weight {weight_key} gradient: {weight_grad.norm().item()}")
-            
-            # Here we introduce DGD with weight decay, which projects the momentums to the orthogonal space, hoping to keep the optimizer memorizing through a long context
-            titans_grads_dict = TensorDict({key: grad for key, grad in zip(titans_fast_weight_keys, titans_grads, strict=True)})
-            
-            # Update the optimizer first then use it to optimize the Titans memory.
-            # It's important to update the optimizer first, otherwise will lead to a suboptimal result.
-            # Both instinctly and according to equation 50 in NL paper.
-            self.titans_memory.inner_optimizer.cal_inner_grads_update(grads_dict=titans_grads_dict, state=state)
-
-            titans_grads_dict_optimized, state = self.titans_memory.inner_optimizer(x=titans_grads_dict, state=state)
-            
-            # print(f"----------------{self.titans_memory.block_name}----------------")
-            # for weight_key, weight_grad in titans_grads_dict_optimized.items():
-            #     print(f"Weight {weight_key} gradient: {weight_grad.norm().item()}")
-            
-            new_titans_fast_weights = {}
-            for (titans_fast_weight_key, titans_grad_optimized), titans_fast_weight_value in zip(titans_grads_dict_optimized.items(), titans_fast_weight_values, strict=True):                        
-                alpha_unsqueezed = alpha
-                while alpha_unsqueezed.ndim != titans_fast_weight_value.ndim:
-                    alpha_unsqueezed = alpha_unsqueezed.unsqueeze(-1)
-                    
-                new_titans_fast_weights[titans_fast_weight_key] = titans_fast_weight_value * alpha_unsqueezed - titans_grad_optimized
-            
-            titans_state.fast_weights = new_titans_fast_weights
-            
-            titans_state.k = None
-            titans_state.v = None
-            titans_state.eta = None
-            titans_state.alpha = None
-            titans_state.last_update_step = titans_state.step.clone()
-            state[self.titans_memory.inner_optimizer.block_name].last_update_step = titans_state.step.clone()
-        
-            # The alpha gradient can only be computed using the fast weights at step t-1.
-            if titans_state.last_q_fast_weight is not None and titans_state.last_k_fast_weight is not None and titans_state.last_v_fast_weight is not None and titans_state.last_alpha_fast_weight is not None and titans_state.last_eta_fast_weight is not None:
-                self.q_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
-                self.k_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
-                self.v_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
-                self.eta_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
-                self.alpha_memory.cal_inner_grads(logits=titans_logits, state=state, y=v, block_grads_dict=block_grads_dict)
-
-                if titans_state.last_step_updated:
-                    titans_state.last_q_fast_weight = state[self.q_memory.block_name].fast_weights
-                    titans_state.last_k_fast_weight = state[self.k_memory.block_name].fast_weights
-                    titans_state.last_v_fast_weight = state[self.v_memory.block_name].fast_weights
-                    titans_state.last_alpha_fast_weight = state[self.alpha_memory.block_name].fast_weights
-                    titans_state.last_eta_fast_weight = state[self.eta_memory.block_name].fast_weights
-            else:
-                titans_state.last_q_fast_weight = state[self.q_memory.block_name].fast_weights
-                titans_state.last_k_fast_weight = state[self.k_memory.block_name].fast_weights
-                titans_state.last_v_fast_weight = state[self.v_memory.block_name].fast_weights
-                titans_state.last_alpha_fast_weight = state[self.alpha_memory.block_name].fast_weights
-                titans_state.last_eta_fast_weight = state[self.eta_memory.block_name].fast_weights
-        
-        if self.children_blocks is not None:
-            for child_block in self.children_blocks:
-                child_block.cal_inner_grads(logits=logits, state=state, y=y, block_grads_dict=block_grads_dict)
+                child_block.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
                 
-    def inner_update(self, state: dict[str, AssocMemState]) -> None:
-        self.q_memory.inner_update(state=state)
-        self.k_memory.inner_update(state=state)
-        self.v_memory.inner_update(state=state)
-        self.alpha_memory.inner_update(state=state)
-        is_updated = self.eta_memory.inner_update(state=state)
-        state[self.titans_memory.block_name].last_step_updated = is_updated
+    def maybe_inner_update(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> None:
+        self.q_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
+        self.k_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
+        self.v_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
+        self.alpha_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
+        updated = self.eta_memory.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
 
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.inner_update(state=state)
+                child_block.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
+                
+        return updated
                 
     def cal_outer_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor) -> None:
         self.titans_memory.cal_outer_grads(logits=logits, state=state, y=y)
@@ -511,3 +434,163 @@ class FullyAdditiveTitansBlock(AssocMemory):
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
                 child_block.optimize()
+    
+    def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
+        if state is None:
+            state = {}
+            
+        if self.q_memory.block_name not in state:
+            self.q_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.k_memory.block_name not in state:
+            self.k_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.v_memory.block_name not in state:
+            self.v_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.eta_memory.block_name not in state:
+            self.eta_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.alpha_memory.block_name not in state:
+            self.alpha_memory.init_state(state=state, batch_size=batch_size)
+            
+        if self.titans_memory.block_name not in state:
+            self.titans_memory.init_state(state=state, batch_size=batch_size)
+        
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block.init_state(state=state, batch_size=batch_size)
+
+        return state
+    
+    def get_calcuable_weights(self, state: dict[str, AssocMemState], parameter_weight_key: str) -> dict[str, torch.Tensor]:
+        weight_keys: list[str] = []
+        weight_values: list[torch.Tensor] = []
+        
+        # Add all memories' fast weights.
+        self.add_calcuable_weights(state[self.q_memory.block_name][parameter_weight_key], self.q_memory.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.k_memory.block_name][parameter_weight_key], self.k_memory.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.v_memory.block_name][parameter_weight_key], self.v_memory.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.alpha_memory.block_name][parameter_weight_key], self.alpha_memory.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.eta_memory.block_name][parameter_weight_key], self.eta_memory.block_name, weight_keys, weight_values)
+        if parameter_weight_key == 'weights':
+            self.add_calcuable_weights(state[self.titans_memory.block_name]['fast_weights'], self.titans_memory.block_name, weight_keys, weight_values)
+        elif parameter_weight_key == 'fast_weights':
+            pass
+        else:
+            raise ValueError(f"Unsupported parameter weight key: {parameter_weight_key}")
+        
+        # Add all memories' inner optimizer's fast weights, including titans memory's inner optimizer.
+        self.add_calcuable_weights(state[self.q_memory.inner_optimizer.block_name][parameter_weight_key], self.q_memory.inner_optimizer.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.k_memory.inner_optimizer.block_name][parameter_weight_key], self.k_memory.inner_optimizer.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.v_memory.inner_optimizer.block_name][parameter_weight_key], self.v_memory.inner_optimizer.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.alpha_memory.inner_optimizer.block_name][parameter_weight_key], self.alpha_memory.inner_optimizer.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.eta_memory.inner_optimizer.block_name][parameter_weight_key], self.eta_memory.inner_optimizer.block_name, weight_keys, weight_values)
+        self.add_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name][parameter_weight_key], self.titans_memory.inner_optimizer.block_name, weight_keys, weight_values)
+        
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+                weight_keys.extend(child_block_keys)
+                weight_values.extend(child_block_values)
+        
+        return weight_keys, weight_values
+    
+    def get_inner_non_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
+        fast_weight_keys: list[str] = []
+        fast_weight_values: list[torch.Tensor] = []
+        
+        memory_keys, memory_values = self.q_memory.get_inner_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.k_memory.get_inner_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.v_memory.get_inner_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.alpha_memory.get_inner_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.eta_memory.get_inner_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        # Add all titans memory parameters here, since they are updated by a deeper level.
+        if self.titans_memory.block_name in state:
+            self.add_non_calcuable_weights(state[self.titans_memory.block_name]['fast_weights'], self.titans_memory.block_name, 'fast_weights', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.titans_memory.block_name]['step'], self.titans_memory.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.titans_memory.block_name]['last_update_step'], self.titans_memory.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.titans_memory.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.block_name]['updates'], self.titans_memory.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.titans_memory.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.block_name]['n_updates'], self.titans_memory.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+        
+        if self.titans_memory.inner_optimizer.block_name in state:
+            self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['step'], self.titans_memory.inner_optimizer.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['last_update_step'], self.titans_memory.inner_optimizer.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.titans_memory.inner_optimizer.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['updates'], self.titans_memory.inner_optimizer.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.titans_memory.inner_optimizer.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['n_updates'], self.titans_memory.inner_optimizer.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_inner_non_calcuable_fast_weights(state=state)
+                fast_weight_keys.extend(child_block_keys)
+                fast_weight_values.extend(child_block_values)
+        
+        return fast_weight_keys, fast_weight_values
+    
+    def get_outer_non_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
+        fast_weight_keys: list[str] = []
+        fast_weight_values: list[torch.Tensor] = []
+        
+        memory_keys, memory_values = self.q_memory.get_outer_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.k_memory.get_outer_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.v_memory.get_outer_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.alpha_memory.get_outer_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        memory_keys, memory_values = self.eta_memory.get_outer_non_calcuable_fast_weights(state=state)
+        fast_weight_keys.extend(memory_keys)
+        fast_weight_values.extend(memory_values)
+        
+        # Add all titans memory parameters here, since they are updated by a deeper level.
+        if self.titans_memory.block_name in state:
+            self.add_non_calcuable_weights(state[self.titans_memory.block_name]['step'], self.titans_memory.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.titans_memory.block_name]['last_update_step'], self.titans_memory.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.titans_memory.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.block_name]['updates'], self.titans_memory.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.titans_memory.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.block_name]['n_updates'], self.titans_memory.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+        
+        if self.titans_memory.inner_optimizer.block_name in state:
+            self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['step'], self.titans_memory.inner_optimizer.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['last_update_step'], self.titans_memory.inner_optimizer.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.titans_memory.inner_optimizer.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['updates'], self.titans_memory.inner_optimizer.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.titans_memory.inner_optimizer.block_name]:
+                self.add_non_calcuable_weights(state[self.titans_memory.inner_optimizer.block_name]['n_updates'], self.titans_memory.inner_optimizer.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_outer_non_calcuable_fast_weights(state=state)
+                fast_weight_keys.extend(child_block_keys)
+                fast_weight_values.extend(child_block_values)
+        
+        return fast_weight_keys, fast_weight_values

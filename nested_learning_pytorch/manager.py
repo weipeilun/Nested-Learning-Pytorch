@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Dict, Tuple, List
 
+import math
+from tensordict import TensorDict
 import torch
 
-from .memory.assoc_memory import AssocMemory, AssocMemSpec, AssocMemState
+from .memory.assoc_memory import AssocMemory, AssocMemSpec
 
 
 class FrequencyManager:
@@ -212,11 +214,66 @@ class FrequencyManager:
             List of child block names (empty if no children)
         """
         return self.hierarchy.get(block_name, [])
+    
+    def get_all_chuck_sizes(self, state: TensorDict[str, TensorDict], sequence_len: int) -> List[int]:
+        all_chunk_sizes = []
+        current_start_step = 0
+        while current_start_step < sequence_len:
+            next_update_step = self.next_update_step(state, current_start_step)
+            if next_update_step > sequence_len:
+                seq_end_step = sequence_len
+            elif next_update_step == current_start_step:
+                break
+            else:
+                seq_end_step = next_update_step
+            all_chunk_sizes.append(seq_end_step - current_start_step)
+            current_start_step = seq_end_step
+        return all_chunk_sizes
         
-    def next_update_step(self, state: dict[str, AssocMemState]) -> int:
+    def next_update_step(self, state: TensorDict[str, TensorDict], current_start_step: int) -> int:
         all_next_update_steps = []
-        for block_name, block_state in state.items():
-            if block_state.last_update_step is not None and isinstance(block_state.last_update_step, torch.Tensor) and block_name in self.frequency_map:
+        for block_name in state.keys():
+            if block_name in self.frequency_map:
                 block_update_frequency = self.frequency_map[block_name]
-                all_next_update_steps.append(block_state.last_update_step + block_update_frequency)
-        return min(next_update_steps.min() for next_update_steps in all_next_update_steps).item()
+                block_next_update_step = math.ceil((current_start_step + 1) / block_update_frequency) * block_update_frequency
+                all_next_update_steps.append(block_next_update_step)
+        return min(all_next_update_steps) if all_next_update_steps else current_start_step
+    
+
+def rebuild_state(grad_weight_values_list: list[torch.Tensor],
+                  non_grad_weight_values_list: list[torch.Tensor],
+                  grad_weight_keys_list: list[str],
+                  non_grad_weight_keys_list: list[str],
+                  weights_keys: str) -> dict[str, dict]:
+    new_state = {}
+    for grad_weight_value, grad_weight_key in zip(grad_weight_values_list, grad_weight_keys_list, strict=True):
+        block_name, grad_key = grad_weight_key.split(AssocMemory.DEFAULT_GRADIENT_KEY_SPLITTER)
+        if block_name not in new_state:
+            new_state[block_name] = {}
+        for weights_key in weights_keys:
+            if weights_key not in new_state[block_name]:
+                new_state[block_name][weights_key] = {}
+            new_state[block_name][weights_key][grad_key] = grad_weight_value
+    for non_grad_weight_value, non_grad_weight_key in zip(non_grad_weight_values_list, non_grad_weight_keys_list, strict=True):
+        block_name, grad_key = non_grad_weight_key.split(AssocMemory.DEFAULT_GRADIENT_KEY_SPLITTER)
+        if block_name not in new_state:
+            new_state[block_name] = {}
+        if grad_key not in new_state[block_name]:
+            new_state[block_name][grad_key] = non_grad_weight_value
+        else:
+            for weights_key in weights_keys:
+                if grad_key == weights_key and isinstance(non_grad_weight_value, dict):
+                    new_state[block_name][grad_key].update(non_grad_weight_value)
+                else:
+                    raise ValueError(f"Unsupported non-grad weight value type: {type(non_grad_weight_value)}")
+    return new_state
+
+def rebuild_state_for_titans(grad_weight_values_list: list[torch.Tensor],
+                             grad_weight_keys_list: list[str],
+                             block_name: str) -> dict[str, dict]:
+    new_state = {}
+    for grad_weight_value, grad_weight_key in zip(grad_weight_values_list, grad_weight_keys_list, strict=True):
+        if block_name not in new_state:
+            new_state[block_name] = {'fast_weights': {}}
+        new_state[block_name]['fast_weights'][grad_weight_key] = grad_weight_value
+    return new_state

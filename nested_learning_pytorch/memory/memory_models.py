@@ -52,7 +52,7 @@ class LayerNorm(Module):
         self.ln = nn.LayerNorm(dim, elementwise_affine = False)
         self.gamma = Parameter(torch.zeros(dim))
         
-        self.target_ndim = 4 if is_multi_head else 3
+        self.target_ndim = 3 if is_multi_head else 2
 
     def forward(self, x):
         gamma = self.gamma
@@ -60,7 +60,7 @@ class LayerNorm(Module):
         if gamma.ndim != self.target_ndim:
             expand_dims = self.target_ndim - gamma.ndim
             for _ in range(expand_dims):
-                gamma = gamma.unsqueeze(1)
+                gamma = gamma.unsqueeze(0)
 
         return self.ln(x) * (gamma + 1.)
 
@@ -112,7 +112,7 @@ class ResidualPreNorm(Normalization):
         self.ln = LayerNorm(dim, is_multi_head=False)
         self.model = model
         
-        self.target_ndim = 4 if is_multi_head else 3
+        self.target_ndim = 3 if is_multi_head else 2
 
     def forward(self, x, pattern: str | list[str] | None = None):
 
@@ -121,7 +121,7 @@ class ResidualPreNorm(Normalization):
         if x.ndim != self.target_ndim:
             expand_dims = self.target_ndim - x.ndim
             for _ in range(expand_dims):
-                x = x.unsqueeze(1)
+                x = x.unsqueeze(0)
         return x + out
 
 class ResidualPostNorm(Normalization):
@@ -139,7 +139,7 @@ class ResidualPostNorm(Normalization):
         self.ln = LayerNorm(dim if out_dim is None else out_dim, is_multi_head=is_multi_head)
         self.model = model
         
-        self.target_ndim = 4 if is_multi_head else 3
+        self.target_ndim = 3 if is_multi_head else 2
 
     def forward(self, x, pattern: str | list[str] | None = None):
 
@@ -148,7 +148,7 @@ class ResidualPostNorm(Normalization):
         if x.ndim != self.target_ndim:
             expand_dims = self.target_ndim - x.ndim
             for _ in range(expand_dims):
-                x = x.unsqueeze(1)
+                x = x.unsqueeze(0)
         return self.ln(x + out)
 
 
@@ -168,7 +168,7 @@ class ResidualNorm(Normalization):
         self.ln = LayerNorm(dim, is_multi_head=is_multi_head)
         self.model = model
         
-        self.target_ndim = 4 if is_multi_head else 3
+        self.target_ndim = 3 if is_multi_head else 2
 
     def forward(self, x, pattern: str | list[str] | None = None):
 
@@ -177,7 +177,7 @@ class ResidualNorm(Normalization):
         if x.ndim != self.target_ndim:
             expand_dims = self.target_ndim - x.ndim
             for _ in range(expand_dims):
-                x = x.unsqueeze(1)
+                x = x.unsqueeze(0)
         return self.norm(out) + x
 
 # memory mlp proposed in TTT
@@ -257,7 +257,7 @@ class MemoryMLP(Module):
             if self.with_bias:
                 bias = self.biases[ind]
                 while bias.ndim != x.ndim:
-                    bias = bias.unsqueeze(1)
+                    bias = bias.unsqueeze(0)
                 x = x + bias
 
         return x
@@ -427,3 +427,12 @@ class MemoryAttention(Module):
         ff_out = h @ ffw2
 
         return attn_out + ff_out
+
+class MomentumModule(nn.Module):
+    """A simple wrapper to make a Parameter compatible with ModuleDict."""
+    def __init__(self, momentum: torch.Tensor):
+        super().__init__()
+        self.momentum = nn.Parameter(momentum)
+    
+    def forward(self, x, pattern=None):
+        return x

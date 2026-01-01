@@ -22,14 +22,14 @@ def main(cfg: DictConfig) -> None:
     y = y.to(device)
     for step in range(steps):
         print(f"step {step}")
-        logits, state = model(x=x, state=state, y=y)
+        grads_dict, state = model.forward_meta_learning(x=x, y=y, state=state)
         
-        model.update(logits=logits, state=state, y=y)
+        model.update(grads_dict=grads_dict)
         
         # Explicitly clean up to prevent memory accumulation
         logits = None
         state = None
-
+ 
 
 if __name__ == "__main__":
     main()

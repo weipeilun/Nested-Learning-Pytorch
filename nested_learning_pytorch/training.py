@@ -102,8 +102,8 @@ def build_model_from_cfg(model_cfg: DictConfig) -> torch.nn.Module:
     optimizer_cfg = {}
     if "optimizers" in model_cfg:
         optimizer_cfg = OmegaConf.to_container(model_cfg.optimizers, resolve=True) # type: ignore[arg-type]
-    inner_loss_fn = get_loss(model_cfg.get("inner_loss_fn", "mse"), reduction='none')
-    outer_loss_fn = get_loss(model_cfg.get("outer_loss_fn", "mse"), reduction='none')
+    inner_loss_fn = get_loss(model_cfg.get("inner_loss_fn", "mse"))
+    outer_loss_fn = get_loss(model_cfg.get("outer_loss_fn", "mse"))
     blocks = [create_assoc_mem_spec(entry, inner_loss_fn, outer_loss_fn) for entry in model_cfg.blocks]
     hope_cfg = ModelConfig(
         num_tokens=model_cfg.num_tokens,

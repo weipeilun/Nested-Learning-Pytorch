@@ -40,6 +40,9 @@ model:
     DeepMomentumGradientDesent:
       alpha: 0.9
       eta: 0.1
+      default_model_kwargs:
+        depth: 2
+        expansion_factor: 4.
 
 data:
   source: synthetic

@@ -12,11 +12,11 @@ from torch.func import functional_call
 from tensordict import TensorDict
 from dataclasses import dataclass
 from einops import rearrange
+from torch.func import grad, vmap
 
 from ..assoc_memory import AssocMemory, AssocMemState
 from ...utils import default, repeat_dict_values, pack_one_with_inverse
-
-from ..memory_models import MemoryMLP
+from ..memory_models import MemoryMLP, NormalizationBuilder, MomentumModule
 
 
 class DeepMomentumGradientDesent(AssocMemory):
@@ -24,10 +24,6 @@ class DeepMomentumGradientDesent(AssocMemory):
     
     # Register this class with type name "Memory"
     _type_name = "DeepMomentumGradientDesent"
-    
-    @dataclass
-    class DeepMomentumGradientDesentState(AssocMemState):
-        momentum: TensorDict | dict[str, torch.Tensor] | None = None
     
     def __init__(
         self,
@@ -41,13 +37,9 @@ class DeepMomentumGradientDesent(AssocMemory):
         params: dict[str, torch.Tensor],
         inner_loss_fn: nn.Module,
         outer_loss_fn: nn.Module,
-        memory_state_clz: type | None = DeepMomentumGradientDesentState,
-        model: Module | None = None,
         alpha: float = 0.9,
         eta: float = 0.1,
-        max_grad_norm: float | None = None,
-        spectral_norm_surprises = False,
-        mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        normalization: str = 'residual_pre_norm',
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -63,7 +55,6 @@ class DeepMomentumGradientDesent(AssocMemory):
             outer_lr=outer_lr,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
-            memory_state_clz=memory_state_clz,
         )
         
         params_dict = {}
@@ -77,234 +68,265 @@ class DeepMomentumGradientDesent(AssocMemory):
                 is_multi_head = True
                 n_heads = param.shape[0]
                 
-            # todo: reduce momentum hidden dimension here to reduce memory usage
-            default_model_kwargs['expansion_factor'] = 2.
-            model = MemoryMLP(param.shape[-1], is_multi_head=is_multi_head, n_heads=n_heads, **default_model_kwargs)
-            # Use small random initialization to break symmetry while staying close to identity
-            for weight in model.weights:
-                nn.init.normal_(weight, mean=0.0, std=0.01)
-            params_dict[safe_name] = model
+            # Param for momentum (wrapped in a module for ModuleDict compatibility)
+            momentum = MomentumModule(torch.zeros_like(param))
+            params_dict[safe_name] = momentum
             
-            # Here is the tricky part: the NL paper doesn't define the preconditioner clearly, but we could just use a linear layer
-            preconditioner = MemoryMLP(dim=param.shape[-1], depth=1, is_multi_head=is_multi_head, n_heads=n_heads)
-            params_dict[f'{safe_name}_preconditioner'] = preconditioner
+            # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
+            if param.ndim > 1:
+                # Equation 51, we can use a higher-order feature map to enhance the capacity of a memory.
+                # This can be configured via hope_xxx.yaml file.
+                preconditioner = MemoryMLP(dim=param.shape[-1], is_multi_head=is_multi_head, n_heads=n_heads, **default_model_kwargs)
+                
+                # the memory is the weights of the model
+
+                if normalization:
+                    preconditioner = NormalizationBuilder(normalization)(dim = param.shape[-1], is_multi_head = is_multi_head, model = preconditioner, **default_model_kwargs)
+
+                params_dict[f'{safe_name}_preconditioner'] = preconditioner
 
             self.param_name_mapping[name] = safe_name
         
         self.model = nn.ModuleDict(params_dict)
-        self.default_pattern = 'b ... d, b d o -> b ... o'
+        self.default_pattern = '... d, d o -> ... o'
         self.default_inverse = nn.Identity()
         
         # Define eta and alpha as non-learnable constants.
         self.register_buffer('alpha', torch.tensor([alpha], dtype=torch.float32))
         self.register_buffer('eta', torch.tensor([eta], dtype=torch.float32))
+        self.register_buffer('eta_ones', torch.ones([1], dtype=torch.float32))
         self.optimizer_key_idx_map = {name: idx for idx, name in enumerate(self.get_optimizer_params().keys())}
         
         # override optimizers - use object.__setattr__ to bypass PyTorch's module registration
         object.__setattr__(self, 'inner_optimizer', None)
         object.__setattr__(self, 'outer_optimizer', None)
-    
+        
+        # The inner optimizer gradient vmap, to calculate preconditioner gradient within each task (in batch dimension)
+        self.preconditioner_grad_fn = grad(self.cal_preconditioner_loss_vmap)
+        
     def retrive_params_by_prefix_lstrip(self, prefix: str, fast_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return TensorDict({name.replace(f'{prefix}.', ''): fast_weights[name] for name in fast_weights.keys() if name.startswith(f'{prefix}.')})
+        return {name.replace(f'{prefix}.', ''): fast_weights[name] for name in fast_weights.keys() if name.startswith(f'{prefix}.')}
         
-    def forward(
-        self,
-        grads_dict: TensorDict,
-        state: dict[str, AssocMemState] | None = None,
-    ):
-        # DeepMomentumGradientDesent should not have children blocks
-        
-        fast_weights = state[self.block_name].fast_weights
-        
-        new_grads_dict = TensorDict({})
-        for name, grad in grads_dict.items():
-            b = grad.shape[0]
-            need_pack = False
-            if grad.dim() == 4:
-                grad_eff = rearrange(grad, 'b h i j -> (b h) i j')
-                grad_eff = grad_eff.mean(dim=1)
-                need_pack = True
-            elif grad.dim() == 3:
-                # matrix weight with batch
-                grad_eff = grad.mean(dim=1) # (b, d2)
-            elif grad.dim() == 2:
-                grad_eff = grad # (b, d2)
-            else:
-                raise ValueError("Unsupported grad shape")
-            
-            safe_name = self.param_name_mapping[name]
-            fast_weight = self.retrive_params_by_prefix_lstrip(safe_name, fast_weights)
-            if need_pack:
-                fast_weight = repeat_dict_values(fast_weight, 'b h i j -> (b h) i j')
-            v = functional_call(self.model[safe_name], dict(fast_weight), (grad_eff,), {'pattern': self.default_pattern})
-            
-            # Normalize the orthogonal space, because we only care the direction in the orthogonal space, and keep the gradient's magnitude.
-            v = torch.nn.functional.normalize(v, dim=1)  # (b, d2)
-            
-            # The rank-1 update operator, equals to v.unsqueeze(2) @ grad_eff.unsqueeze(2).transpose(1, 2)
-            P = v.unsqueeze(2) * grad_eff.unsqueeze(1) # (b, d2, d2)
-            
-            # Apply to the gradient
-            if grad.dim() == 4:
-                P = rearrange(P, '(b h) i j -> b h i j', b = b)
-                grad_delta = grad @ P # (b, h, d1, d2)
-            elif grad.dim() == 3:
-                grad_delta = grad @ P # (b, d1, d2)
-            elif grad.dim() == 2:
-                grad_delta = (grad.unsqueeze(1) @ P).squeeze(1) # (b, d2)
-            else:
-                raise ValueError("Unsupported grad shape")
-            
-            new_grads_dict[name] = grad_delta
-            
-        return new_grads_dict, state
-    
-    def update_preconditioner(self, preconditioner_fast_weight: dict[str, torch.Tensor], grad: torch.Tensor, preconditioner_safe_name: str, eps: float = 1e-6) -> dict[str, torch.Tensor]:
+    def cal_preconditioner_loss_vmap(self, preconditioner_fast_weight_values: list[torch.Tensor], grad: torch.Tensor, preconditioner_fast_weight_keys: list[torch.Tensor], preconditioner_safe_name: str, eps: float = 1e-6) -> dict[str, torch.Tensor]:
         # Using the loss function in equation 43: ||O.T @ O - I||_F^2 to update the preconditioner.
+        # A vmap loss calculator. No batch dimension.
         # Gram matrix: [d, d]
-        O = functional_call(self.model[preconditioner_safe_name], dict(preconditioner_fast_weight), (grad,), {'pattern': self.default_pattern})
+        preconditioner_fast_weight = dict(zip(preconditioner_fast_weight_keys, preconditioner_fast_weight_values, strict=True))
+        
+        O = functional_call(self.model[preconditioner_safe_name], preconditioner_fast_weight, (grad,), {'pattern': self.default_pattern})        # (d1, d2)
 
-        # ---- flatten non-batch dims ----
-        O_flat = O.view(O.shape[0], -1)        # (b, D)
+        assert O.ndim == 2, "Unsupported O shape"
 
         # ---- per-task normalization ----
-        O_norm = F.normalize(O_flat, dim=1, eps=eps)  # (b, D)
+        O_norm = F.normalize(O, dim=-1, eps=eps)  # (d1, d2)
 
         # ---- Gram matrix per task ----
         # G_i = O_i O_i^T  (rank-1)
-        G = torch.bmm(
-            O_norm.unsqueeze(2),         # (b, D, 1)
-            O_norm.unsqueeze(1)          # (b, 1, D)
-        )                                # (b, D, D)
+        G = torch.matmul(
+            O_norm,                             # (d1, d2)
+            O_norm.transpose(-2, -1)            # (d2, d1)
+        )                                       # (d1, d1)
 
-        # enforce unit energy
-        # We sum the batch dimension of the loss to avoid the division by the number of tasks.
-        preconditioner_loss = ((G.diagonal(dim1=1, dim2=2) - 1) ** 2).sum()
+        # Eliminate off-diagonal elements. This is the orthogonal space.
+        # equation 43 (Delta rule) 
+        # preconditioner_loss = ((G - torch.diag_embed(G.diagonal(dim1=-2, dim2=-1))) ** 2).mean()
+        preconditioner_loss = ((G - torch.eye(G.shape[-1], device=G.device)) ** 2).mean()
         
-        preconditioner_fast_weight_keys = []
-        preconditioner_fast_weight_values = []
-        for preconditioner_fast_weight_name, preconditioner_fast_weight_value in preconditioner_fast_weight.items():
-            preconditioner_fast_weight_keys.append(preconditioner_fast_weight_name)
-            preconditioner_fast_weight_values.append(preconditioner_fast_weight_value)
-        
-        preconditioner_grads = torch.autograd.grad(
-            outputs=preconditioner_loss,
-            inputs=preconditioner_fast_weight_values,
-            retain_graph=True,
-            create_graph=True,
-        )
-        
-        # Update the preconditioner with one-step inner loop.
-        preconditioner_fast_weight_update = dict()
-        for preconditioner_fast_weight_key, preconditioner_grad, preconditioner_fast_weight_value in zip(preconditioner_fast_weight_keys, preconditioner_grads, preconditioner_fast_weight_values, strict=True):
-            preconditioner_fast_weight_update[preconditioner_fast_weight_key] = preconditioner_fast_weight_value + preconditioner_grad * (-1)
-        return TensorDict(preconditioner_fast_weight_update)
+        return preconditioner_loss
     
-    def cal_inner_grads_update(self, grads_dict: torch.Tensor, state: dict[str, AssocMemState], eps: float = 1e-6) -> None:
-        updated = False
+    def update_preconditioners(self, grads_dict: TensorDict, state: dict[str, AssocMemState]) -> TensorDict:
         if hasattr(self, 'model') and self.model is not None:
-            fast_weights = state[self.block_name].fast_weights
-            momentum = state[self.block_name].momentum
+            fast_weights = state[self.block_name]['fast_weights']
+            updates = state[self.block_name]['updates']
+            n_updates = state[self.block_name]['n_updates']
             
-            with torch.enable_grad():
-                fast_weights_updated = {}
-                momentum_updated = {}
-                for grad_name, grad in grads_dict.items():
-                    b = grad.shape[0]
-                    need_pack = False
-                    
-                    if grad.dim() == 4:
-                        g_eff = rearrange(grad, 'b h i j -> (b h) i j')
-                        g_eff = g_eff.mean(dim=1)
-                        need_pack = True
-                    elif grad.dim() == 3:
-                        # g: (b, d1, d2) -> (b, d2)
-                        g_eff = grad.mean(dim=1)
-                    elif grad.dim() == 2:
-                        # g: (b, d2)
-                        g_eff = grad
+            # Updates are added through multiple chunks, we need to divide by the number of chunks to get the average gradient.
+            averaged_updates = self.average_updates(updates=updates, n_updates=n_updates)
+            
+            # Step 1: apply gradients to the preconditioner.
+            # Equation 41 in NL paper.
+            applied_grads_fast_weights = {}
+            for fast_weight_key, fast_weight_value in fast_weights.items():
+                if '_preconditioner' in fast_weight_key:
+                    if fast_weight_key in averaged_updates:
+                        applied_grads_fast_weights[fast_weight_key] = fast_weight_value + averaged_updates[fast_weight_key] * (-self.inner_lr)
                     else:
-                        raise ValueError("Unsupported g shape")
-                    
-                    preconditioner_safe_name = f'{self.param_name_mapping[grad_name]}_preconditioner'
-                    preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, fast_weights)
-                    if need_pack:
-                        preconditioner_fast_weight_dict = repeat_dict_values(preconditioner_fast_weight_dict, 'b h i j -> (b h) i j')
-                    
-                    # We update the preconditioner with one-step inner loop first, and then use the updated preconditioner to update the momentum.
-                    # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task, which is a geometric correction of the orthogonal vector space, rather than a numerical optimization in SGD.
-                    preconditioner_fast_weight_dict = self.update_preconditioner(preconditioner_fast_weight_dict, g_eff, preconditioner_safe_name)
-                    preconditioner_fast_weight = next(iter(preconditioner_fast_weight_dict.values()))
-                    
-                    # Then we use the updated preconditioner to update the optimizer and momentum.
-                    optimizer_fast_weights = self.retrive_params_by_prefix_lstrip(self.param_name_mapping[grad_name], fast_weights)
-                    if need_pack:
-                        optimizer_fast_weights = repeat_dict_values(optimizer_fast_weights, 'b h i j -> (b h) i j')
-                    
-                    # Loss function in equation 49
-                    grad_col = g_eff.unsqueeze(-1)  # (b, d2, 1)
-                    
-                    h = grad_col
-                    optimizer_fast_weight_keys = []
-                    optimizer_fast_weight_values = []
-                    for optimizer_fast_weight_key, optimizer_fast_weight_value in optimizer_fast_weights.items():
-                        optimizer_fast_weight_keys.append(optimizer_fast_weight_key)
-                        optimizer_fast_weight_values.append(optimizer_fast_weight_value)
-                        
-                        h = torch.bmm(optimizer_fast_weight_value.transpose(1, 2), h)    # (b, dn, 1)
-                        
-                    m_g = torch.bmm(h, grad_col.transpose(1, 2))    # (b, d2, d2)
-                    
-                    # To orthogonalized / normalized space
-                    m_g_flat = rearrange(m_g, 'b i j -> b (i j)')
-                    P_flat = rearrange(preconditioner_fast_weight, 'b i j -> b (i j)')
-                    # Normalize m_g_flat here because we don't want to optimize the magnitude of the orthogonalized space, only the direction.
-                    m_g_hat = F.normalize(m_g_flat, dim=1, eps=eps)
-                    P_hat = F.normalize(P_flat, dim=1, eps=eps)
-                    
-                    # L2 loss in orthogonalized space (delta rule)
-                    # We sum the batch dimension of the loss to avoid the division by the number of tasks, which is not expected in meta learning.
-                    loss = ((m_g_hat - P_hat) ** 2).sum(dim=1).sum()
-                    
-                    optimizer_fast_weight_grads = torch.autograd.grad(
-                        outputs=loss,
-                        inputs=optimizer_fast_weight_values,
-                        retain_graph=True,
-                        create_graph=True,
-                    )
-                    if need_pack:
-                        optimizer_fast_weight_grads = [rearrange(optimizer_fast_weight_grad, '(b h) i j -> b h i j', b = b) for optimizer_fast_weight_grad in optimizer_fast_weight_grads]
-                    
-                    # update the fast weights directly
-                    for optimizer_fast_weight_key, optimizer_fast_weight_grad in zip(optimizer_fast_weight_keys, optimizer_fast_weight_grads, strict=True):
-                        tmp_weight_key = f'{self.param_name_mapping[grad_name]}.{optimizer_fast_weight_key}'
-                        
-                        alpha_unsqueezed = self.alpha
-                        while alpha_unsqueezed.ndim != optimizer_fast_weight_grad.ndim:
-                            alpha_unsqueezed = alpha_unsqueezed.unsqueeze(-1)
-                        eta_unsqueezed = self.eta
-                        while eta_unsqueezed.ndim != optimizer_fast_weight_grad.ndim:
-                            eta_unsqueezed = eta_unsqueezed.unsqueeze(-1)
-                            
-                        # Equation 50
-                        # alpha is initialized near 1, and optimizer_fast_weight_grad is already weighted by eta
-                        momentum_updated[tmp_weight_key] = momentum[tmp_weight_key] * alpha_unsqueezed - optimizer_fast_weight_grad * eta_unsqueezed
-                        fast_weights_updated[tmp_weight_key] = fast_weights[tmp_weight_key] + momentum_updated[tmp_weight_key]
-                    
-                    if need_pack:
-                        preconditioner_fast_weight_dict = repeat_dict_values(preconditioner_fast_weight_dict, '(b h) i j -> b h i j', b = b)
-                    for preconditioner_fast_weight_key, preconditioner_fast_weight_value in preconditioner_fast_weight_dict.items():
-                        fast_weights_updated[f'{self.param_name_mapping[grad_name]}_preconditioner.{preconditioner_fast_weight_key}'] = preconditioner_fast_weight_value
+                        applied_grads_fast_weights[fast_weight_key] = fast_weight_value
+                else:
+                    applied_grads_fast_weights[fast_weight_key] = fast_weight_value
+            
+            # Step 2: optimize the preconditioner to orthogonal space.
+            new_fast_weights = {}
+            for grad_name, grad_value in grads_dict.items():
+                need_pack = False
                 
-                state[self.block_name].fast_weights = fast_weights_updated
-                state[self.block_name].momentum = momentum_updated
-                updated = True
+                if grad_value.dim() == 3:
+                    g_eff = grad_value
+                    need_pack = True
+                elif grad_value.dim() == 2:
+                    # g: (d1, d2) -> (d2)
+                    g_eff = grad_value
+                elif grad_value.dim() == 1:
+                    # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
+                    continue
+                else:
+                    raise ValueError("Unsupported g shape")
+                
+                preconditioner_safe_name = f'{self.param_name_mapping[grad_name]}_preconditioner'
+                preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, applied_grads_fast_weights) # (d2, d2)
+                if need_pack:
+                    preconditioner_fast_weight_dict = repeat_dict_values(preconditioner_fast_weight_dict, 'b h i j -> (b h) i j')
+                    
+                preconditioner_fast_weight_keys = []
+                preconditioner_fast_weight_values = []
+                for preconditioner_fast_weight_key, preconditioner_fast_weight_value in preconditioner_fast_weight_dict.items():
+                    preconditioner_fast_weight_keys.append(preconditioner_fast_weight_key)
+                    preconditioner_fast_weight_values.append(preconditioner_fast_weight_value)
+                
+                # We update the preconditioner with one-step inner loop first, and then use the updated preconditioner to update the momentum.
+                # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task, which is a geometric correction of the orthogonal vector space, rather than a numerical optimization in SGD.
+                # torch.no_grad() to cut the computation graph of the preconditioner, because we don't want higher order derivatives.
+                # todo: need to avoid higher order derivatives?
+                with torch.no_grad():
+                    preconditioner_grads = self.preconditioner_grad_fn(preconditioner_fast_weight_values, g_eff, preconditioner_fast_weight_keys, preconditioner_safe_name)
+                
+                # Update the preconditioner with one-step inner loop.
+                # Equation 44 in NL paper.
+                for preconditioner_fast_weight_key, preconditioner_grad, preconditioner_fast_weight_value in zip(preconditioner_fast_weight_keys, preconditioner_grads, preconditioner_fast_weight_values, strict=True):
+                    new_fast_weights[f'{preconditioner_safe_name}.{preconditioner_fast_weight_key}'] = preconditioner_fast_weight_value + preconditioner_grad * (-self.inner_lr)
+            
+            for fast_weight_key, fast_weight_value in applied_grads_fast_weights.items():
+                if fast_weight_key not in new_fast_weights:
+                    new_fast_weights[fast_weight_key] = fast_weight_value
+            
+            # Step 3: check if only preconditioner is updated.
+            assert len(new_fast_weights) == len(fast_weights), "New fast weights should have the same length as old fast weights"
+            # for fast_weight_key, fast_weight_value in new_fast_weights.items():
+            #     if '_preconditioner' not in fast_weight_key:
+            #         assert (new_fast_weights[fast_weight_key] == fast_weights[fast_weight_key]).all(), f"Momentum {fast_weight_key} should not be updated"
+            #     else:
+            #         assert (new_fast_weights[fast_weight_key] != fast_weights[fast_weight_key]).any(), f"Preconditioner {fast_weight_key} should be updated"
+            
+            state[self.block_name]['fast_weights'] = new_fast_weights
 
-        # There supposedly should be no children blocks for DeepMomentumGradientDesent
-        # if self.children_blocks is not None:
-        #     for child_block in self.children_blocks:
-        #         child_block.cal_inner_grads(logits=logits, state=state, y=y)
-        return updated
+            return True
+        return False
+    
+    def forward(self, x: TensorDict, state: dict[str, AssocMemState], alpha: torch.Tensor | None = None) -> TensorDict:
+        fast_weights = state[self.block_name]['fast_weights']
+        
+        if alpha is None:
+            alpha = self.alpha
+            eta = self.eta
+        else:
+            # If we received a not None alpha, we assume the learning rate (eta) is dealt outside when calculating loss.
+            alpha = alpha
+            eta = self.eta_ones
+            
+        # Optimize the momentum and the fast weights for each optimizer parameter.
+        new_momentum_fast_weights_dict = dict()
+        for grad_name, grad_value in x.items():
+            need_pack = False
+            
+            if grad_value.dim() == 3:
+                # g: (h, d1, d2)
+                g_eff = grad_value
+                need_pack = True
+            elif grad_value.dim() == 2:
+                # g: (d1, d2)
+                g_eff = grad_value
+            elif grad_value.dim() == 1:
+                # g: (d2)
+                g_eff = grad_value
+            else:
+                raise ValueError("Unsupported g shape")
+            
+            if grad_value.dim() > 1:
+                # Step 1: get the updated preconditioner fast weight.
+                preconditioner_safe_name = f'{self.param_name_mapping[grad_name]}_preconditioner'
+                preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, fast_weights) # (d2, d2)                if need_pack:
+                if need_pack:
+                    preconditioner_fast_weight_dict = repeat_dict_values(preconditioner_fast_weight_dict, 'b h i j -> (b h) i j')
+                
+                # Step 2: the gradient in orthogonalized space.
+                grad_in_orthogonalized_space = functional_call(self.model[preconditioner_safe_name], preconditioner_fast_weight_dict, (g_eff,), {'pattern': self.default_pattern})
+            elif grad_value.dim() == 1:
+                # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
+                grad_in_orthogonalized_space = g_eff
+            else:
+                raise ValueError("Unsupported g shape")
+            
+            # Step 3: update the momentum (fast weights) of the optimizer.
+            # Equation 47 (Hebbian-rule) / 49 (delta rule), depending on self.inner_loss_fn, calculated at the end of vmap.
+            momentum_fast_weights_dict = self.retrive_params_by_prefix_lstrip(self.param_name_mapping[grad_name], fast_weights)
+            if need_pack:
+                momentum_fast_weights_dict = repeat_dict_values(momentum_fast_weights_dict, 'b h i j -> (b h) i j')
+            try:
+                assert len(momentum_fast_weights_dict) == 1, f"Momentum should have only one fast weight: {self.block_name}"
+            except Exception as e:
+                print(f"Error in forward: {e}")
+                print(f"momentum_fast_weights_dict: {momentum_fast_weights_dict}")
+                print(f"fast_weights: {fast_weights}")
+                print(f"grad_name: {grad_name}")
+                print(f"grad_value: {grad_value}")
+                raise e
+            
+            for momentum_fast_weights_key, momentum_fast_weights_value in momentum_fast_weights_dict.items():
+                alpha_unsqueezed = alpha
+                while alpha_unsqueezed.ndim != momentum_fast_weights_value.ndim:
+                    alpha_unsqueezed = alpha_unsqueezed.unsqueeze(-1)
+                eta_unsqueezed = eta
+                while eta_unsqueezed.ndim != momentum_fast_weights_value.ndim:
+                    eta_unsqueezed = eta_unsqueezed.unsqueeze(-1)
+                    
+                new_momentum_fast_weights_dict[f'{self.param_name_mapping[grad_name]}.{momentum_fast_weights_key}'] = momentum_fast_weights_value * alpha_unsqueezed - grad_in_orthogonalized_space * eta_unsqueezed
+            
+        for fast_weight_key, fast_weight_value in fast_weights.items():
+            if fast_weight_key not in new_momentum_fast_weights_dict:
+                new_momentum_fast_weights_dict[fast_weight_key] = fast_weight_value
+                
+        state[self.block_name]['fast_weights'] = new_momentum_fast_weights_dict
+        return new_momentum_fast_weights_dict, state
+    
+    def get_calcuable_weights(self, state: dict[str, AssocMemState], parameter_weight_key: str) -> dict[str, torch.Tensor]:
+        weight_keys: list[str] = []
+        weight_values: list[torch.Tensor] = []
+        
+        if self.block_name in state:
+            weights = state[self.block_name][parameter_weight_key]
+            for key, value in weights.items():
+                # preconditioner update is not in vmap, it's need to be added to non_calcuable_fast_weights
+                if '_preconditioner' in key:
+                    weight_keys.append(f"{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
+                    weight_values.append(value)
+                elif parameter_weight_key == 'weights':
+                    weight_keys.append(f"{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
+                    weight_values.append(value)
+            
+        return weight_keys, weight_values
+    
+    def get_inner_non_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
+        fast_weight_keys: list[str] = []
+        fast_weight_values: list[torch.Tensor] = []
+        
+        if self.block_name in state:
+            fast_weights = state[self.block_name]['fast_weights']
+            preconditioner_fast_weights_dict = dict()
+            for key, value in fast_weights.items():
+                # preconditioner update is not in vmap, it's need to be added to non_calcuable_fast_weights
+                if '_preconditioner' not in key:
+                    preconditioner_fast_weights_dict[key] = value
+            fast_weight_keys.append(f"{self.block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}fast_weights")
+            fast_weight_values.append(preconditioner_fast_weights_dict)
+            
+            self.add_non_calcuable_weights(state[self.block_name]['step'], self.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.block_name]['last_update_step'], self.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.block_name]:
+                self.add_non_calcuable_weights(state[self.block_name]['updates'], self.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.block_name]:
+                self.add_non_calcuable_weights(state[self.block_name]['n_updates'], self.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+            
+        return fast_weight_keys, fast_weight_values
     
     def get_optimizer_params(self) -> TensorDict:
         return TensorDict({name: param for name, param in self.model.named_parameters() if '_preconditioner' not in name})
@@ -312,18 +334,17 @@ class DeepMomentumGradientDesent(AssocMemory):
     def get_preconditioner_params(self) -> TensorDict:
         return TensorDict({name: param for name, param in self.model.named_parameters() if '_preconditioner' in name})
     
-    def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
-        state = super().init_state(state=state, batch_size=batch_size)
+    # def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
+    #     state = super().init_state(state=state, batch_size=batch_size)
         
-        batch_size = default(batch_size, 1)
-        device = next(self.parameters()).device
+    #     batch_size = default(batch_size, 1)
+    #     device = next(self.parameters()).device
         
-        weights = self.get_optimizer_params()
-        weights = repeat_dict_values(weights, '... -> b ...', b = batch_size).to(device)
-        # Convert non-leaf tensors to leaf tensors for optimization
-        # Use clone() to ensure separate memory storage for each tensor
-        weights = {k: v.clone().detach().zero_().requires_grad_() for k, v in weights.items()}
+    #     weights = self.get_optimizer_params()
+    #     # Convert non-leaf tensors to leaf tensors for optimization
+    #     # Use clone() to ensure separate memory storage for each tensor
+    #     weights = {k: torch.stack([v.clone().detach().zero_().requires_grad_() for _ in range(batch_size)]) for k, v in weights.items()}
         
-        state[self.block_name].momentum = weights
+    #     state[self.block_name]['momentum'] = weights
         
-        return state
+    #     return state

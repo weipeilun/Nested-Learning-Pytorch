@@ -14,7 +14,7 @@ from tensordict import TensorDict
 from .factory import _ASSOC_MEMORY_REGISTRY
 from .optim.factory import build_inner_optimizer, build_outer_optimizer
 
-from ..utils import repeat_dict_values, default
+from ..utils import default
 
 
 DEFAULT_INNER_OPTIMIZER_SUF = '_inner_optimizer'
@@ -24,16 +24,16 @@ DEFAULT_OUTER_OPTIMIZER_SUF = '_outer_optimizer'
 def update_step(forward_fn):
     """Decorator that automatically updates the step counter after forward returns."""
     @wraps(forward_fn)
-    def wrapper(self, x, state: dict[str, AssocMemState] | None = None, auto_update_step: bool = True):
+    def wrapper(self, x, state: dict[str, AssocMemState] | None = None, auto_update_step: bool = True, *args, **kwargs):
         # Call the original forward method
-        logits, state = forward_fn(self, x, state)
+        logits, state = forward_fn(self, x, state, *args, **kwargs)
         
         if auto_update_step:
-            if self.block_name in state and state[self.block_name].last_update_step is not None and isinstance(state[self.block_name].last_update_step, torch.Tensor):
+            if self.block_name in state and state[self.block_name]['last_update_step'] is not None and isinstance(state[self.block_name]['last_update_step'], torch.Tensor):
                 if self.block_name.endswith('_inner_optimizer'):
-                    # We can't observe sequence length from optimizers, so we use it's parent block's sequence length
+                    # We can't observe sequence length from optimizers because its inputs and outputs are gradients, so we use it's parent block's sequence length
                     parent_block_name = self.block_name.replace('_inner_optimizer', '')
-                    state[self.block_name].step = state[parent_block_name].step.clone()
+                    state[self.block_name]['step'] = state[parent_block_name]['step'].clone()
                 else:
                     if x.ndim == 2:
                         seq_len = x.shape[0]
@@ -41,7 +41,7 @@ def update_step(forward_fn):
                         seq_len = x.shape[1]
                     else:
                         raise ValueError(f"Invalid input shape: {x.shape}")
-                    state[self.block_name].step += seq_len
+                    state[self.block_name]['step'] += seq_len
                 
         return logits, state
     
@@ -97,7 +97,6 @@ class AssocMemory(nn.Module):
                  outer_lr: float,
                  inner_loss_fn: nn.Module,
                  outer_loss_fn: nn.Module,
-                 memory_state_clz: type | None = None
                  ): 
         super().__init__()
         
@@ -117,10 +116,9 @@ class AssocMemory(nn.Module):
         self.outer_loss_fn = outer_loss_fn
         
         self.dim = dim
-        self.memory_state_clz = memory_state_clz
         
         self.children_blocks = None
-    
+        
     def init_children_blocks(self, dim: int, block_specs: Sequence[AssocMemSpec], optimizer_configs: Dict[str, dict]) -> None:
         children_blocks = []
         if block_specs is not None:
@@ -132,142 +130,111 @@ class AssocMemory(nn.Module):
                 ))
         if children_blocks:
             self.children_blocks = nn.ModuleList(children_blocks)
-    
-    def call_children_blocks(self, x, state: dict[str, AssocMemState] | None = None) -> dict[str, tuple[torch.Tensor, dict[str, AssocMemState]]]:
-        if self.children_blocks is not None:
-            return {child_block.block_name: child_block(x=x, state=state) for child_block in self.children_blocks}
-        else:
-            return {}
 
     @update_step
-    def forward(self, x, state: dict[str, AssocMemState] | None = None) -> tuple[torch.Tensor, dict[str, AssocMemState]]:  # type: ignore[override]
+    def forward(self, x, state: dict[str, AssocMemState] | None = None, *args, **kwargs) -> tuple[torch.Tensor, dict[str, AssocMemState]]:  # type: ignore[override]
         raise NotImplementedError
-    
-    def add_calcuable_fast_weights(
-        self, 
-        fast_weight_dict: dict[str, torch.Tensor] | None, 
-        memory_block_name: str,
-        fast_weight_keys: list[str],
-        fast_weight_values: list[torch.Tensor]
-    ) -> None:
-        """Helper method to add fast weights from a memory block to the accumulator lists."""
-        if fast_weight_dict is not None:
-            for key, value in fast_weight_dict.items():
-                fast_weight_keys.append(f"{memory_block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
-                fast_weight_values.append(value)
-    
-    def get_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
-        fast_weight_keys: list[str] = []
-        fast_weight_values: list[torch.Tensor] = []
-        
-        self.add_calcuable_fast_weights(state[self.block_name].fast_weights, self.block_name, fast_weight_keys, fast_weight_values)
-        
-        if self.children_blocks is not None:
-            for child_block in self.children_blocks:
-                child_block_keys, child_block_values = child_block.get_calcuable_fast_weights(state=state)
-                fast_weight_keys.extend(child_block_keys)
-                fast_weight_values.extend(child_block_values)
-        
-        return fast_weight_keys, fast_weight_values
                 
-    # calculate the sum of gradients across sequence dimension for each block and sum to state.updates
-    def cal_inner_grads(self, logits: torch.Tensor, state: dict[str, AssocMemState], y: torch.Tensor, block_grads_dict: dict[str, torch.Tensor]) -> None:
+    # cache the gradients of sequence dimension for each block and sum to state.updates
+    def cache_inner_grads(self, state: dict[str, AssocMemState], block_grads_dict: dict[str, torch.Tensor]) -> None:
         if hasattr(self, 'model') and self.model is not None:
-            fast_weights = state[self.block_name].fast_weights
-            updates = state[self.block_name].updates
+            updates = state[self.block_name].get('updates', None)
+            n_updates = state[self.block_name].get('n_updates', torch.zeros_like(state[self.block_name]['step'], dtype=torch.float32))
             
-            if self.block_name in block_grads_dict:
-                grads_dict = block_grads_dict[self.block_name]
-                    
-                key_grads_iter = grads_dict.items()
-            else:
-                warnings.warn(f"Autometically calculating gradients for {self.block_name} failed, please check the gradient flow.")
-                with torch.enable_grad():
-                    losses = self.inner_loss_fn(logits, y)
-                    
-                    fast_weight_keys = []
-                    fast_weight_values = []
-                    for fast_weight_name, fast_weight_value in fast_weights.items():
-                        fast_weight_keys.append(fast_weight_name)
-                        fast_weight_values.append(fast_weight_value)
-                    
-                    # Compute gradients with respect to fast_weights
-                    # We need to compute the second order gradients in higher levels, so we need to set retain_graph and create_graph to True
-                    # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
-                    # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
-                    # levels (or outer-loop)."
-                    # We sum the batch dimension of the loss to avoid the division by the number of tasks, which is not expected in meta learning.
-                    grads = torch.autograd.grad(
-                        outputs=losses.sum(dim=1).mean(dim=0),
-                        inputs=fast_weight_values,
-                        retain_graph=True,
-                        create_graph=True,
-                    )
-                    
-                    key_grads_iter = zip(fast_weight_keys, grads, strict=True)
-                    
+            assert self.block_name in block_grads_dict, f"Gradients for {self.block_name} not found in block_grads_dict, please check the gradient flow."
+            
+            grads_dict = block_grads_dict[self.block_name]
+                
             new_updates = {}
-            for fast_weight_key, grad in key_grads_iter: 
-                # add to historic gradients
-                if grad is not None:
+            try:
+                for fast_weight_key, fast_weight_grad in grads_dict.items(): 
+                    # add to historic gradients
                     if updates is not None:
-                        new_updates[fast_weight_key] = updates[fast_weight_key] + grad
+                        new_updates[fast_weight_key] = updates[fast_weight_key] + fast_weight_grad
                     else:
-                        new_updates[fast_weight_key] = grad
+                        new_updates[fast_weight_key] = fast_weight_grad
+            except Exception as e:
+                print(f"Error in cache_inner_grads: {e}")
+                print(f"grads_dict: {grads_dict}")
+                print(f"updates: {updates}")
+                print(f"n_updates: {n_updates}")
+                print(f"block_grads_dict: {block_grads_dict}")
+                print(f"state: {state}")
+                raise e
         
             if new_updates:
-                state[self.block_name].updates = new_updates
-                
-                # # check gradients towards weights
-                # weights = state[self.block_name].weights
-                # weights_list = list(weights.values())
-                # weights_list_grads = torch.autograd.grad(
-                #     outputs=losses.sum(dim=1).mean(dim=0),
-                #     inputs=weights_list,
-                #     retain_graph=True,
-                # )
-                # print(f"----------------{self.block_name}----------------")
-                # for weight_key, weight_grad in zip(weights.keys(), weights_list_grads, strict=True):
-                #     print(f"Weight {weight_key} gradient: {weight_grad.norm().item()}")
+                state[self.block_name]['updates'] = new_updates
+                state[self.block_name]['n_updates'] = n_updates + 1
+            
+            # cache the updates for the inner optimizer
+            if '_inner_optimizer' not in self.block_name:
+                self.inner_optimizer.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
                 
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.cal_inner_grads(logits=logits, state=state, y=y, block_grads_dict=block_grads_dict)
-
-    def inner_update(self, state: dict[str, AssocMemState]) -> bool:
+                child_block.cache_inner_grads(state=state, block_grads_dict=block_grads_dict)
+                
+    def maybe_inner_update_preconditioner(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> bool:
         updated = False
-        if state[self.block_name].step is not None and (state[self.block_name].step - state[self.block_name].last_update_step >= self.chunk_size).all():
-            fast_weights = state[self.block_name].fast_weights
-            updates = state[self.block_name].updates
+        if self.block_name in step_need_update_dict and step_need_update_dict[self.block_name]:
+            updates = state[self.block_name]['updates']
             
-            if updates is not None:
-                # Here we introduce DGD with weight decay, which projects the momentums to the orthogonal space, hoping to keep the optimizer memorizing through a long context
-                # Update the optimizer first then use it to optimize the Titans memory.
-                # It's important to update the optimizer first, otherwise will lead to a suboptimal result.
-                # Both instinctly and according to equation 50 in NL paper.
-                self.inner_optimizer.cal_inner_grads_update(grads_dict=updates, state=state)
+            # Here we introduce DGD with weight decay, which projects the momentums to the orthogonal space, hoping to keep the optimizer memorizing through a long context
+            # Update the optimizer first then use it to optimize the Titans memory.
+            # It's important to update the optimizer first, otherwise will lead to a suboptimal result - both instinctly and according to equation 50 in NL paper.
+            
+            # Step 1: apply gradients and one-step update preconditioner.
+            # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task.
+            # We need t's preconditioner gradients rather than step t - 1's at step t + 1, so we must apply inner_optimizer's gradients before calling inner_optimizer.forward().
+            updated = self.inner_optimizer.update_preconditioners(grads_dict=updates, state=state)
+            assert updated, "Preconditioner update failed"
+            
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block.maybe_inner_update_preconditioner(state=state, step_need_update_dict=step_need_update_dict)
+                
+        return updated
 
-                updates_optimized, state = self.inner_optimizer(x=updates, state=state)
+    def maybe_inner_update(self, state: dict[str, AssocMemState], step_need_update_dict: dict[str, bool]) -> bool:
+        updated = False
+        if self.block_name in step_need_update_dict and step_need_update_dict[self.block_name]:
+            fast_weights = state[self.block_name]['fast_weights']
+            updates = state[self.block_name]['updates']
+            n_updates = state[self.block_name]['n_updates']
+            
+            # Updates are added through multiple chunks, we need to divide by the number of chunks to get the average gradient.
+            averaged_updates = self.average_updates(updates=updates, n_updates=n_updates)
+            
+            # Here we introduce DGD with weight decay, which projects the momentums to the orthogonal space, hoping to keep the optimizer memorizing through a long context
+            # Update the optimizer first then use it to optimize the Titans memory.
+            # It's important to update the optimizer first, otherwise will lead to a suboptimal result - both instinctly and according to equation 50 in NL paper.
+            
+            # Step 2: update the momentums (fast weights) using inner optimizer.
+            updates_optimized, state = self.inner_optimizer(x=averaged_updates, state=state)
+            
+            # Step 3: update the fast weights.
+            # Equation 50 in NL paper.
+            new_fast_weights = {}
+            for fast_weight_key, fast_weight_value in fast_weights.items():
+                momentum_key = f"{self.inner_optimizer.param_name_mapping[fast_weight_key]}.momentum"
                 
-                new_fast_weights = {}
-                for update_key, grad_optimized in updates_optimized.items():
-                    # fast weights need to be updated
-                    weight_value = fast_weights[update_key]
-                    
-                    new_fast_weights[update_key] = weight_value + grad_optimized * (-self.inner_lr)
+                assert momentum_key in updates_optimized, f"Momentum key {momentum_key} not found in updates_optimized"
                 
-                # Update fast_weights with the new values
-                state[self.block_name].fast_weights = new_fast_weights
+                new_fast_weights[fast_weight_key] = fast_weight_value + updates_optimized[momentum_key]
+            
+            # Update fast_weights with the new values.
+            state[self.block_name]['fast_weights'] = new_fast_weights
                 
             # handle state after update
-            state[self.block_name].updates = None
-            state[self.block_name].last_update_step = state[self.block_name].step.clone()
-            state[self.inner_optimizer.block_name].last_update_step = state[self.block_name].step.clone()
+            state[self.block_name]['updates'] = {update_key: torch.zeros_like(update_value) for update_key, update_value in updates.items()}
+            state[self.block_name]['n_updates'] = torch.zeros_like(n_updates)
+            state[self.block_name]['last_update_step'] = state[self.block_name]['step'].clone()
+            state[self.inner_optimizer.block_name]['last_update_step'] = state[self.block_name]['step'].clone()
             updated = True
 
         if self.children_blocks is not None:
             for child_block in self.children_blocks:
-                child_block.inner_update(state=state)
+                child_block.maybe_inner_update(state=state, step_need_update_dict=step_need_update_dict)
                 
         return updated
     
@@ -348,15 +315,23 @@ class AssocMemory(nn.Module):
         else:
             return None
     
+    def average_updates(self, updates: TensorDict, n_updates: torch.Tensor) -> TensorDict:
+        new_updates = {}
+        for update_key, update_value in updates.items():
+            n_updates_unsqueezed = n_updates
+            while n_updates_unsqueezed.ndim != update_value.ndim:
+                n_updates_unsqueezed = n_updates_unsqueezed.unsqueeze(-1)
+            new_updates[update_key] = update_value / n_updates_unsqueezed
+        return new_updates
+    
     def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
         if state is None:
-            state = {}
+            state = dict()
         
         batch_size = default(batch_size, 1)
         
         if self.block_name not in state:
             weights = self.memory_model_parameter_dict
-            updates = None
             last_update_step = None
             step = None
             
@@ -366,21 +341,16 @@ class AssocMemory(nn.Module):
                 last_update_step = torch.zeros(batch_size, dtype=torch.int32, device=device, requires_grad=False)
                 step = torch.zeros(batch_size, dtype=torch.int32, device=device, requires_grad=False)
                 
-                weights = repeat_dict_values(weights, '... -> b ...', b = batch_size).to(device)
-                
                 # Convert non-leaf tensors to leaf tensors for optimization
                 # Use clone() to ensure separate memory storage for each tensor
-                weights = {k: v.clone().detach().requires_grad_() for k, v in weights.items()}
-            
-            state_clz = self.memory_state_clz if self.memory_state_clz is not None else AssocMemState
-            state[self.block_name] = state_clz(
-                last_update_step=last_update_step,
-                step=step,
-                weights=weights,
-                fast_weights=weights,
-                updates=updates,
-            )
-        
+                weights = {k: torch.stack([v.clone().detach().requires_grad_().to(device) for _ in range(batch_size)]) for k, v in weights.items()}            
+                
+                state[self.block_name] = {
+                    'last_update_step': last_update_step,
+                    'step': step,
+                    'weights': weights,
+                    'fast_weights': weights,
+                }        
         if self.inner_optimizer is not None and isinstance(self.inner_optimizer, AssocMemory):
             self.inner_optimizer.init_state(state=state, batch_size=batch_size)
         if self.outer_optimizer is not None and isinstance(self.outer_optimizer, AssocMemory):
@@ -391,6 +361,100 @@ class AssocMemory(nn.Module):
                 child_block.init_state(state=state, batch_size=batch_size)
 
         return state
+    
+    def add_calcuable_weights(
+        self, 
+        weight_dict: dict[str, torch.Tensor] | None, 
+        memory_block_name: str,
+        weight_keys: list[str],
+        weight_values: list[torch.Tensor]
+    ) -> None:
+        """Helper method to add fast weights from a memory block to the accumulator lists."""
+        if weight_dict is not None:
+            for key, value in weight_dict.items():
+                weight_keys.append(f"{memory_block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key}")
+                weight_values.append(value)
+    
+    def add_non_calcuable_weights(
+        self, 
+        value_tensor: torch.Tensor | None, 
+        memory_block_name: str,
+        key_name: str,
+        fast_weight_keys: list[str],
+        fast_weight_values: list[torch.Tensor]
+    ) -> None:
+        """Helper method to add fast weights from a memory block to the accumulator lists."""
+        if value_tensor is not None:
+            fast_weight_keys.append(f"{memory_block_name}{self.DEFAULT_GRADIENT_KEY_SPLITTER}{key_name}")
+            fast_weight_values.append(value_tensor)
+    
+    def get_calcuable_weights(self, state: dict[str, AssocMemState], parameter_weight_key: str) -> dict[str, torch.Tensor]:
+        weight_keys: list[str] = []
+        weight_values: list[torch.Tensor] = []
+        
+        if self.block_name in state:
+            self.add_calcuable_weights(state[self.block_name][parameter_weight_key], self.block_name, weight_keys, weight_values)
+        
+            optimizer_keys, optimizer_values = self.inner_optimizer.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+            weight_keys.extend(optimizer_keys)
+            weight_values.extend(optimizer_values)
+            
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
+                weight_keys.extend(child_block_keys)
+                weight_values.extend(child_block_values)
+        
+        return weight_keys, weight_values
+    
+    def get_inner_non_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
+        fast_weight_keys: list[str] = []
+        fast_weight_values: list[torch.Tensor] = []
+        
+        if self.block_name in state:
+            self.add_non_calcuable_weights(state[self.block_name]['step'], self.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.block_name]['last_update_step'], self.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.block_name]:
+                self.add_non_calcuable_weights(state[self.block_name]['updates'], self.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.block_name]:
+                self.add_non_calcuable_weights(state[self.block_name]['n_updates'], self.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+            
+            optimizer_keys, optimizer_values = self.inner_optimizer.get_inner_non_calcuable_fast_weights(state=state)
+            fast_weight_keys.extend(optimizer_keys)
+            fast_weight_values.extend(optimizer_values)
+
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_inner_non_calcuable_fast_weights(state=state)
+                fast_weight_keys.extend(child_block_keys)
+                fast_weight_values.extend(child_block_values)
+        
+        return fast_weight_keys, fast_weight_values
+    
+    def get_outer_non_calcuable_fast_weights(self, state: dict[str, AssocMemState]) -> dict[str, torch.Tensor]:
+        fast_weight_keys: list[str] = []
+        fast_weight_values: list[torch.Tensor] = []
+        
+        if self.block_name in state:
+            self.add_non_calcuable_weights(state[self.block_name]['step'], self.block_name, 'step', fast_weight_keys, fast_weight_values)
+            self.add_non_calcuable_weights(state[self.block_name]['last_update_step'], self.block_name, 'last_update_step', fast_weight_keys, fast_weight_values)
+            if 'updates' in state[self.block_name]:
+                self.add_non_calcuable_weights(state[self.block_name]['updates'], self.block_name, 'updates', fast_weight_keys, fast_weight_values)
+            if 'n_updates' in state[self.block_name]:
+                self.add_non_calcuable_weights(state[self.block_name]['n_updates'], self.block_name, 'n_updates', fast_weight_keys, fast_weight_values)
+            
+            if '_inner_optimizer' not in self.block_name:
+                optimizer_keys, optimizer_values = self.inner_optimizer.get_outer_non_calcuable_fast_weights(state=state)
+                fast_weight_keys.extend(optimizer_keys)
+                fast_weight_values.extend(optimizer_values)
+
+        if self.children_blocks is not None:
+            for child_block in self.children_blocks:
+                child_block_keys, child_block_values = child_block.get_outer_non_calcuable_fast_weights(state=state)
+                fast_weight_keys.extend(child_block_keys)
+                fast_weight_values.extend(child_block_values)
+        
+        return fast_weight_keys, fast_weight_values
     
 def _build_block(spec: AssocMemSpec, optimizer_configs: Dict[str, dict], dim: int, **kwargs) -> AssocMemory:
     """Factory function to create a block instance based on AssocMemSpec.type.
@@ -503,7 +567,7 @@ class AssocMemState:
     step: torch.Tensor | int = 0  # shape: (batch_size,) or scalar
     weights: TensorDict | dict[str, torch.Tensor] | None = None,  # TensorDict with batch_size dimension
     fast_weights: TensorDict | dict[str, torch.Tensor] | None = None,  # TensorDict with batch_size dimension
-    updates: dict[str, torch.Tensor] | None = None, # updates (gradients) for each parameter
+    # updates: TensorDict[str, torch.Tensor] | None = None, # updates (gradients) for each parameter
 
 def block_state_detach(
     state: AssocMemState
@@ -524,8 +588,8 @@ class AssocMemSpec:
     outer_loss_fn: nn.Module
     warmup_steps: int = 0
     jitter: int = 0
-    inner_lr: float = 1.0e-4
-    outer_lr: float = 1.0e-4
+    inner_lr: float = 5.0e-3
+    outer_lr: float = 5.0e-4
     hidden_multiplier: int = 4
     children_blocks: List[AssocMemSpec] = field(default_factory=list)
     extra_params: Dict = field(default_factory=dict)  # Store all custom parameters here
