@@ -71,8 +71,8 @@ class DeepMomentumGradientDesent(AssocMemory):
             momentum = MomentumModule(torch.zeros_like(param))
             params_dict[safe_name] = momentum
             
-            # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
-            if param.ndim > 1:
+            # Prevent the params with no geometry from being orthogonalized to prevent over fitting.
+            if self.param_support_orthogonalization(param):
                 # Equation 51, we can use a higher-order feature map to enhance the capacity of a memory.
                 # This can be configured via hope_xxx.yaml file.
                 # It's a gradient, all imformation of grads are important - scale, angle, curvature, correlation, energy etc. 
@@ -163,17 +163,14 @@ class DeepMomentumGradientDesent(AssocMemory):
             for grad_name, grad_value in grads_dict.items():
                 need_pack = False
                 
-                if grad_value.dim() == 3:
-                    g_eff = grad_value
-                    need_pack = True
-                elif grad_value.dim() == 2:
-                    # g: (d1, d2) -> (d2)
-                    g_eff = grad_value
-                elif grad_value.dim() == 1:
-                    # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
-                    continue
+                if self.param_support_orthogonalization(grad_value):
+                    if grad_value.dim() == 3:
+                        need_pack = True
+                    elif grad_value.dim() > 3:
+                        raise ValueError("Unsupported g shape")
                 else:
-                    raise ValueError("Unsupported g shape")
+                    # Prevent the params with no geometry from being orthogonalized to prevent over fitting.
+                    continue
                 
                 preconditioner_safe_name = f'{self.param_name_mapping[grad_name]}_preconditioner'
                 preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, applied_grads_fast_weights) # (d2, d2)
@@ -190,7 +187,7 @@ class DeepMomentumGradientDesent(AssocMemory):
                 # The goal is to eliminate the most obvious non-orthogonal components in the current batch/task, which is a geometric correction of the orthogonal vector space, rather than a numerical optimization in SGD.
                 # torch.no_grad() to cut the computation graph of the preconditioner, because we don't want higher order derivatives.
                 with torch.no_grad():
-                    preconditioner_grads = self.preconditioner_grad_fn(preconditioner_fast_weight_values, g_eff, preconditioner_fast_weight_keys, preconditioner_safe_name)
+                    preconditioner_grads = self.preconditioner_grad_fn(preconditioner_fast_weight_values, grad_value, preconditioner_fast_weight_keys, preconditioner_safe_name)
                 
                 # Update the preconditioner with one-step inner loop.
                 # Equation 44 in NL paper.
@@ -235,31 +232,22 @@ class DeepMomentumGradientDesent(AssocMemory):
             need_pack = False
             
             if grad_value.dim() == 3:
-                # g: (h, d1, d2)
-                g_eff = grad_value
                 need_pack = True
-            elif grad_value.dim() == 2:
-                # g: (d1, d2)
-                g_eff = grad_value
-            elif grad_value.dim() == 1:
-                # g: (d2)
-                g_eff = grad_value
-            else:
+            
+            if grad_value.dim() > 3:
                 raise ValueError("Unsupported g shape")
             
             # Step 1: map the gradient to orthogonalized space.
-            if grad_value.dim() > 1:
+            if self.param_support_orthogonalization(grad_value):
                 preconditioner_safe_name = f'{self.param_name_mapping[grad_name]}_preconditioner'
-                preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, fast_weights) # (d2, d2)                if need_pack:
+                preconditioner_fast_weight_dict = self.retrive_params_by_prefix_lstrip(preconditioner_safe_name, fast_weights) # (d2, d2)
                 if need_pack:
                     preconditioner_fast_weight_dict = repeat_dict_values(preconditioner_fast_weight_dict, 'b h i j -> (b h) i j')
                 
-                grad_in_orthogonalized_space = functional_call(self.model[preconditioner_safe_name], preconditioner_fast_weight_dict, (g_eff,), {'pattern': self.default_pattern})
-            elif grad_value.dim() == 1:
-                # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
-                grad_in_orthogonalized_space = g_eff
+                grad_in_orthogonalized_space = functional_call(self.model[preconditioner_safe_name], preconditioner_fast_weight_dict, (grad_value,), {'pattern': self.default_pattern})
             else:
-                raise ValueError("Unsupported g shape")
+                # There is no geometry in bias, so we ignore the preconditioner to prevent over fitting.
+                grad_in_orthogonalized_space = grad_value
             
             # Step 2: update the momentum (fast weights) of the optimizer.
             # Equation 47 (Hebbian-rule) / 49 (delta rule), depending on self.inner_loss_fn, calculated at the end of vmap.
@@ -333,17 +321,12 @@ class DeepMomentumGradientDesent(AssocMemory):
     def get_preconditioner_params(self) -> TensorDict:
         return TensorDict({name: param for name, param in self.model.named_parameters() if '_preconditioner' in name})
     
-    # def init_state(self, state: dict[str, AssocMemState] | None = None, batch_size: int | None = None) -> dict[str, AssocMemState]:
-    #     state = super().init_state(state=state, batch_size=batch_size)
-        
-    #     batch_size = default(batch_size, 1)
-    #     device = next(self.parameters()).device
-        
-    #     weights = self.get_optimizer_params()
-    #     # Convert non-leaf tensors to leaf tensors for optimization
-    #     # Use clone() to ensure separate memory storage for each tensor
-    #     weights = {k: torch.stack([v.clone().detach().zero_().requires_grad_() for _ in range(batch_size)]) for k, v in weights.items()}
-        
-    #     state[self.block_name]['momentum'] = weights
-        
-    #     return state
+    def param_support_orthogonalization(self, param: torch.Tensor) -> bool:
+        # For weights with one dimension of 1, they can be considered to be orthogonal by themselves. So there is no need to perform an orthogonal operation again in a geometric sense.
+        if param.dim() > 1:
+            last_two_dims = param.shape[-2:]
+            if last_two_dims[0] == 1 or last_two_dims[1] == 1:
+                return False
+        elif param.dim() == 1:
+            return False
+        return True 

@@ -118,18 +118,15 @@ class HOPEModel(nn.Module):
         # In section 8.1 (https://abehrouz.github.io/files/NL.pdf): "Note that, again, the initial states of all memories, i.e., M□,0
         # for any □ ∈ {𝒌, 𝒗, 𝒒, 𝜂, 𝛼, memory} are meta-learned across all sequences/contexts, and so are optimized in the higher
         # levels (or outer-loop)."
-        pbar = tqdm(
+        for chunk_size, step_need_update_dict in tqdm(
             zip(chunk_sizes, step_need_update_dict_list, strict=True),
             total=len(chunk_sizes),
             leave=False
-        )
-        for chunk_size, step_need_update_dict in pbar:
+        ):
             seq_start_step = current_step
             seq_end_step = seq_start_step + chunk_size
             seq = x[seq_start_step:seq_end_step, :]
             target = y[seq_start_step:seq_end_step, :]
-            
-            pbar.set_description(f"seq_len {seq_start_step}")
             
             grad_weight_keys_list: list[str] = []
             grad_weight_values_list: list[torch.Tensor] = []
