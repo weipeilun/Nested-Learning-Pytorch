@@ -95,6 +95,7 @@ class AssocMemory(nn.Module):
                  dim: int | None,
                  inner_lr: float,
                  outer_lr: float,
+                 lr_multiple: float,
                  inner_loss_fn: nn.Module,
                  outer_loss_fn: nn.Module,
                  ): 
@@ -114,6 +115,8 @@ class AssocMemory(nn.Module):
         self.outer_lr = outer_lr
         self.inner_loss_fn = inner_loss_fn
         self.outer_loss_fn = outer_loss_fn
+        
+        self.lr_multiple = lr_multiple
         
         self.dim = dim
         
@@ -335,13 +338,7 @@ class AssocMemory(nn.Module):
         weight_values: list[torch.Tensor] = []
         
         if self.block_name in state:
-            try:
-                self.add_calcuable_weights(state[self.block_name][parameter_weight_key], self.block_name, weight_keys, weight_values)
-            except Exception as e:
-                print(f"Error in get_calcuable_weights: {e}")
-                print(f"state: {state}")
-                print(f"parameter_weight_key: {parameter_weight_key}")
-                raise e
+            self.add_calcuable_weights(state[self.block_name][parameter_weight_key], self.block_name, weight_keys, weight_values)
         
             optimizer_keys, optimizer_values = self.inner_optimizer.get_calcuable_weights(state=state, parameter_weight_key=parameter_weight_key)
             weight_keys.extend(optimizer_keys)
@@ -454,6 +451,7 @@ def _build_block(spec: AssocMemSpec, optimizer_configs: Dict[str, dict], dim: in
         'outer_optimizer': None,
         'inner_lr': spec.inner_lr,
         'outer_lr': spec.outer_lr,
+        'lr_multiple': spec.lr_multiple,
         'inner_loss_fn': spec.inner_loss_fn,
         'outer_loss_fn': spec.outer_loss_fn,
         **extra_params,  # Add all extra custom parameters
@@ -541,6 +539,7 @@ class AssocMemSpec:
     jitter: int = 0
     inner_lr: float = 5.0e-3
     outer_lr: float = 5.0e-4
+    lr_multiple: float = 1.0
     hidden_multiplier: int = 4
     children_blocks: List[AssocMemSpec] = field(default_factory=list)
     extra_params: Dict = field(default_factory=dict)  # Store all custom parameters here

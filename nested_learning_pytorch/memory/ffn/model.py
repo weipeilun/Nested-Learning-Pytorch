@@ -47,6 +47,7 @@ class FFNBlock(AssocMemory):
         outer_optimizer: Callable | tuple[Callable, Callable],
         inner_lr: float,
         outer_lr: float,
+        lr_multiple: float,
         inner_loss_fn: nn.Module,
         outer_loss_fn: nn.Module,
         model: Module | None = None,
@@ -67,6 +68,7 @@ class FFNBlock(AssocMemory):
             dim=dim,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
         )

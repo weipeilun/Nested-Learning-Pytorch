@@ -59,7 +59,7 @@ def create_assoc_mem_spec(config_dict: dict, inner_loss_fn: nn.Module, outer_los
     # Define the standard fields that AssocMemSpec accepts
     standard_fields = {
         'name', 'type', 'update_period', 'warmup_steps', 'jitter',
-        'inner_lr', 'outer_lr', 'hidden_multiplier', 'children_blocks'
+        'inner_lr', 'outer_lr', 'lr_multiple', 'hidden_multiplier', 'children_blocks'
     }
     
     # Separate standard fields from extra fields

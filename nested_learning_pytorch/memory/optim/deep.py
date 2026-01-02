@@ -34,11 +34,13 @@ class DeepMomentumGradientDesent(AssocMemory):
         outer_optimizer: Callable | tuple[Callable, Callable],
         inner_lr: float,
         outer_lr: float,
+        lr_multiple: float,
         params: dict[str, torch.Tensor],
         inner_loss_fn: nn.Module,
         outer_loss_fn: nn.Module,
-        alpha: float = 0.9,
-        eta: float = 0.1,
+        alpha: float = 0.99,
+        eta: float = 0.01,
+        zeta: float = 0.01,
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -52,6 +54,7 @@ class DeepMomentumGradientDesent(AssocMemory):
             dim=dim,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
         )
@@ -88,13 +91,13 @@ class DeepMomentumGradientDesent(AssocMemory):
         self.default_inverse = nn.Identity()
         
         # Define eta and alpha as non-learnable constants.
-        self.register_buffer('alpha', torch.tensor([alpha], dtype=torch.float32))
-        self.register_buffer('eta', torch.tensor([eta], dtype=torch.float32))
+        self.register_buffer('alpha', torch.tensor([alpha - (eta * (lr_multiple - 1))], dtype=torch.float32))
+        self.register_buffer('eta', torch.tensor([eta * lr_multiple], dtype=torch.float32))
         self.register_buffer('eta_ones', torch.ones([1], dtype=torch.float32))
-        self.optimizer_key_idx_map = {name: idx for idx, name in enumerate(self.get_optimizer_params().keys())}
         
         # The inner optimizer gradient vmap, to calculate preconditioner gradient within each task (in batch dimension)
         self.preconditioner_grad_fn = grad(self.cal_preconditioner_loss_vmap)
+        self.zeta = zeta * lr_multiple
         
         # override optimizers - use object.__setattr__ to bypass PyTorch's module registration
         object.__setattr__(self, 'inner_optimizer', None)
@@ -151,7 +154,7 @@ class DeepMomentumGradientDesent(AssocMemory):
                 for fast_weight_key, fast_weight_value in fast_weights.items():
                     if '_preconditioner' in fast_weight_key:
                         if fast_weight_key in averaged_updates:
-                            applied_grads_fast_weights[fast_weight_key] = fast_weight_value + averaged_updates[fast_weight_key] * (-self.inner_lr)
+                            applied_grads_fast_weights[fast_weight_key] = fast_weight_value + averaged_updates[fast_weight_key] * (-self.zeta)
                         else:
                             applied_grads_fast_weights[fast_weight_key] = fast_weight_value
             else:
@@ -192,7 +195,7 @@ class DeepMomentumGradientDesent(AssocMemory):
                 # Update the preconditioner with one-step inner loop.
                 # Equation 44 in NL paper.
                 for preconditioner_fast_weight_key, preconditioner_grad, preconditioner_fast_weight_value in zip(preconditioner_fast_weight_keys, preconditioner_grads, preconditioner_fast_weight_values, strict=True):
-                    new_fast_weights[f'{preconditioner_safe_name}.{preconditioner_fast_weight_key}'] = preconditioner_fast_weight_value + preconditioner_grad * (-self.inner_lr)
+                    new_fast_weights[f'{preconditioner_safe_name}.{preconditioner_fast_weight_key}'] = preconditioner_fast_weight_value + preconditioner_grad * (-self.zeta)
             
             for fast_weight_key, fast_weight_value in fast_weights.items():
                 if fast_weight_key not in new_fast_weights:

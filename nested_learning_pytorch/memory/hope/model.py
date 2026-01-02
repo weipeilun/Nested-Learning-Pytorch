@@ -29,6 +29,7 @@ class HOPEBlock(AssocMemory):
             dim=None,
             inner_lr=None,
             outer_lr=None,
+            lr_multiple=None,
             inner_loss_fn=config.inner_loss_fn,
             outer_loss_fn=config.outer_loss_fn,
             )

@@ -64,6 +64,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         outer_optimizer: Callable | tuple[Callable, Callable],
         inner_lr: float,
         outer_lr: float,
+        lr_multiple: float,
         inner_loss_fn: nn.Module,
         outer_loss_fn: nn.Module,
         pre_rmsnorm = True,
@@ -83,6 +84,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             dim=dim,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
         )
@@ -95,11 +97,14 @@ class FullyAdditiveTitansBlock(AssocMemory):
 
         self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
         
+        adaptive_lr_multiple = self.get_lr_multiple_based_on_chunk_size(base_chunk_size=chunk_size_titans, base_lr_multiple=lr_multiple, target_chunk_size=chunk_size_adaptive)
+        
         titans_optimizer = inner_optimizer.clone()
         titans_optimizer.kwargs['chunk_size'] = titans_optimizer.kwargs.pop('chunk_size_titans')
         titans_optimizer.kwargs.pop('chunk_size_adaptive')
         titans_block_name = f'{self.block_name}_titans'
         titans_optimizer.kwargs['block_name'] = f'{titans_block_name}_inner_optimizer'
+        titans_optimizer.kwargs['lr_multiple'] = lr_multiple
         self.titans_memory = FFNBlock(
             block_name=titans_block_name,
             chunk_size=chunk_size_titans,
@@ -108,6 +113,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             normalization=None,
@@ -119,6 +125,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         q_optimizer.kwargs.pop('chunk_size_titans')
         q_block_name = f'{self.block_name}_q'
         q_optimizer.kwargs['block_name'] = f'{q_block_name}_inner_optimizer'
+        q_optimizer.kwargs['lr_multiple'] = adaptive_lr_multiple
         q_kwargs = default_model_kwargs.copy()
         q_kwargs['depth'] = 1
         self.q_memory = FFNBlock(
@@ -129,6 +136,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=adaptive_lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             normalization=None,
@@ -140,6 +148,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         k_optimizer.kwargs.pop('chunk_size_titans')
         k_block_name = f'{self.block_name}_k'
         k_optimizer.kwargs['block_name'] = f'{k_block_name}_inner_optimizer'
+        k_optimizer.kwargs['lr_multiple'] = adaptive_lr_multiple
         k_kwargs = default_model_kwargs.copy()
         k_kwargs['depth'] = 1
         self.k_memory = FFNBlock(
@@ -150,6 +159,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=adaptive_lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             normalization=None,
@@ -161,6 +171,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         v_optimizer.kwargs.pop('chunk_size_titans')
         v_block_name = f'{self.block_name}_v'
         v_optimizer.kwargs['block_name'] = f'{v_block_name}_inner_optimizer'
+        v_optimizer.kwargs['lr_multiple'] = adaptive_lr_multiple
         v_kwargs = default_model_kwargs.copy()
         v_kwargs['depth'] = 1
         self.v_memory = FFNBlock(
@@ -171,6 +182,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=adaptive_lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             normalization=None,
@@ -182,6 +194,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         eta_optimizer.kwargs.pop('chunk_size_titans')
         eta_block_name = f'{self.block_name}_eta'
         eta_optimizer.kwargs['block_name'] = f'{eta_block_name}_inner_optimizer'
+        eta_optimizer.kwargs['lr_multiple'] = adaptive_lr_multiple
         eta_kwargs = default_model_kwargs.copy()
         eta_kwargs['out_dim'] = 1
         self.eta_memory = FFNBlock(
@@ -192,6 +205,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=adaptive_lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             is_multi_head=False,
@@ -205,6 +219,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
         alpha_optimizer.kwargs.pop('chunk_size_titans')
         alpha_block_name = f'{self.block_name}_alpha'
         alpha_optimizer.kwargs['block_name'] = f'{alpha_block_name}_inner_optimizer'
+        alpha_optimizer.kwargs['lr_multiple'] = adaptive_lr_multiple
         alpha_kwargs = default_model_kwargs.copy()
         alpha_kwargs['out_dim'] = 1
         self.alpha_memory = FFNBlock(
@@ -215,6 +230,7 @@ class FullyAdditiveTitansBlock(AssocMemory):
             outer_optimizer=outer_optimizer,
             inner_lr=inner_lr,
             outer_lr=outer_lr,
+            lr_multiple=adaptive_lr_multiple,
             inner_loss_fn=inner_loss_fn,
             outer_loss_fn=outer_loss_fn,
             is_multi_head=False,
@@ -576,3 +592,6 @@ class FullyAdditiveTitansBlock(AssocMemory):
                 fast_weight_values.extend(child_block_values)
         
         return fast_weight_keys, fast_weight_values
+    
+    def get_lr_multiple_based_on_chunk_size(self, base_chunk_size: int, base_lr_multiple: float, target_chunk_size: int) -> float:
+        return base_lr_multiple * (target_chunk_size / base_chunk_size) ** 0.5

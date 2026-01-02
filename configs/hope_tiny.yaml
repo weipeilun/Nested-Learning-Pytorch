@@ -10,6 +10,10 @@ hydra:
 # 2. inner optimizer for meta learning in Titans block: DeepMomentumGradientDesent
 # 3. outer optimizer for updating the initial weights of memories: AdamW
 # That's because for each initial weights updating the context of each batch is considered independent, while inner loops treat the tokens between batches as highly correlated.
+
+# The learning rates should be different between levels 
+# alpha and eta are the learning rates of the FFN optimizer, but not the learning rate of the Titans optimizer.
+# zeta is the learning rate of the optimizer preconditioner.
 model:
   num_tokens: 64
   dim: 32
@@ -21,25 +25,30 @@ model:
     - name: memory_slow
       type: FFN
       update_period: 256
+      lr_multiple: 2.828
       children_blocks:
         - name: memory_mid
           type: FFN
           update_period: 128
+          lr_multiple: 2
           children_blocks:
             - name: memory_fast
               type: FFN
               update_period: 64
+              lr_multiple: 1.414
               children_blocks:
                 - name: titans_memory
                   type: FullyAdaptiveTitans
                   update_period_adaptive: 64
                   update_period_titans: 32
+                  lr_multiple: 1
   optimizers:
     AdamW:
       betas: [0.9, 0.999]
     DeepMomentumGradientDesent:
-      alpha: 0.99
-      eta: 0.01 # it's the learning rate of the optimizer (momentum) which is a FFN memory, not the learning rate of the Titans memory.
+      alpha: 0.995
+      eta: 0.005 # it's the learning rate of the optimizer (momentum) which is a FFN memory, not the learning rate of the Titans memory.
+      zeta: 0.002 # it's the learning rate of the preconditioner.
       default_model_kwargs:
         depth: 2
         expansion_factor: 4.
